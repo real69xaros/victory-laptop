@@ -172,6 +172,28 @@ impl Shader {
     }
 }
 
+/// `VICTORY_WAVE_WIDE_ONLY=<hash>,<hash>...`: the shaders (by the 16-digit hash the logs name
+/// them with) whose console wave64 compute programs may take the wave-wide form on a 32-lane
+/// host (`victory_shader::emit::with_wave_wide`), as `VICTORY_WAVE_WIDE=1` lets every program.
+/// A program that keeps `WaveSize(64)` there is refused by NVIDIA's runtime ("wave lane count
+/// of 64"), and its dispatches are dropped every frame: in gameplay `CS_Visibility`
+/// (369cbe906ea72764) and `CS_Tiling_Generate_Opaque` (2cc4c197ee29e291) translate to 32-lane
+/// waves this way. The listed hash of `container`, if it is listed.
+#[cfg(windows)]
+fn wide_only(container: &[u8]) -> Option<String> {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .map(|v| v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect())
+            .unwrap_or_default()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    list.contains(&hash).then_some(hash)
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
@@ -182,7 +204,17 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = match wide_only(container) {
+        // Listed: the wave-wide form, translated here each run and never cached (the cache key
+        // does not know the list).
+        Some(hash) => {
+            let host = victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(container))
+                .map_err(|e| e.to_string())?;
+            tracing::info!(hash, "shader translated with wave-wide branches (VICTORY_WAVE_WIDE_ONLY)");
+            host
+        }
+        None => crate::shader_cache::host_shader(container)?,
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

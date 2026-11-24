@@ -297,6 +297,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// See [`with_wave_wide`].
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form allowed for a console wave64 compute
+/// program on a 32-lane host, as `VICTORY_WAVE_WIDE=1` allows it for every program: the
+/// per-lane branches around the places where the two host waves must exchange are taken by the
+/// whole wave at once, at two group barriers per branch. For one program at a time
+/// (`VICTORY_WAVE_WIDE_ONLY` in the GPU crate), since the form once lost the card on two
+/// particle programs.
+pub fn with_wave_wide<R>(f: impl FnOnce() -> R) -> R {
+    let was = WIDE_HERE.replace(true);
+    let r = f();
+    WIDE_HERE.set(was);
+    r
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -379,7 +397,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
