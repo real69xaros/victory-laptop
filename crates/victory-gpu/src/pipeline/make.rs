@@ -14,6 +14,15 @@
 //!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
+//!
+//! In the world the workers have more work than they can do, and most of
+//! it is the host driver's compiles of big compute programs: 92 took 10 s
+//! or more each in run vg2 (1,610 s of worker time), while a graphics
+//! pipeline takes about 0.3-1.4 s. In the order of the title's first uses,
+//! the cheap pipelines waited behind them: those first bound in vg2's
+//! world were made a median 160-207 s later. `VICTORY_PIPELINE_SMALL_FIRST=1`
+//! takes small pipelines before big compute programs ([`big_bytes`]) and
+//! puts the big ones on at most [`big_workers`] workers.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,6 +42,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// A compute program big enough that the host driver takes seconds to
+    /// compile it ([`big_bytes`]).
+    big: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -49,6 +61,7 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let big = matches!(&shaders[..], [s] if s.stage == "compute" && s.container.len() >= big_bytes());
         Pending {
             shaders,
             graphics,
@@ -56,6 +69,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            big,
         }
     }
 
@@ -221,6 +235,11 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// With [`small_first`]: the big ones ([`big_bytes`]), taken after the others.
+    early_big: VecDeque<Arc<Pending>>,
+    requested_big: VecDeque<Arc<Pending>>,
+    /// With [`small_first`]: big ones being made now.
+    big_making: usize,
 }
 
 impl Queue {
@@ -228,34 +247,107 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            early_big: VecDeque::new(),
+            requested_big: VecDeque::new(),
+            big_making: 0,
         }
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+        self.push_as(p, priority, small_first())
+    }
+
+    /// [`Queue::push`]; `split`: big ones go to queues of their own
+    /// ([`small_first`]).
+    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, split: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        let big = split && p.big;
+        match (priority == REQUESTED, big) {
+            (true, false) => self.requested.push_back(p.clone()),
+            (true, true) => self.requested_big.push_back(p.clone()),
+            (false, false) => self.early.push_back(p.clone()),
+            (false, true) => self.early_big.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        self.pop_as(small_first().then(big_workers))
+    }
+
+    /// [`Queue::pop`]; `big_cap`: with [`small_first`], the most big ones
+    /// made at once – requested small ones first, then requested big ones
+    /// while fewer than that are being made, then the early ones in the
+    /// same order. `None` takes them as they were queued.
+    fn pop_as(&mut self, big_cap: Option<usize>) -> Option<Arc<Pending>> {
+        // An early entry can have been promoted and claimed already.
+        fn early_entry(q: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+            std::iter::from_fn(|| q.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        }
+        let big_ok = big_cap.is_some_and(|cap| self.big_making < cap);
+        let p = match self.requested.pop_front() {
+            Some(p) => p,
+            None => match big_ok.then(|| self.requested_big.pop_front()).flatten() {
+                Some(p) => p,
+                None => match early_entry(&mut self.early) {
+                    Some(p) => p,
+                    None => big_ok.then(|| early_entry(&mut self.early_big)).flatten()?,
+                },
+            },
+        };
+        if big_cap.is_some() && p.big {
+            self.big_making += 1;
+        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+
+    /// A big one ([`Queue::pop_as`] with a cap) is made: room for the next.
+    fn big_done(&mut self) {
+        self.big_making = self.big_making.saturating_sub(1);
+    }
+}
+
+/// Small pipelines before big compute programs, and the big ones on at most
+/// [`big_workers`] workers (`VICTORY_PIPELINE_SMALL_FIRST=1`; off by default).
+fn small_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SMALL_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// The size of a compute program's container from which it counts as big
+/// ([`small_first`]): 16 KB, or `VICTORY_PIPELINE_BIG_KB`. Over runs vg1 and
+/// vg2, programs of 16 KB or more were 228 of the 233 that the driver took
+/// 5 s or more to compile, and 2 of those that took less than a second
+/// (median by size: under 4 KB 0.09 s, 4-16 KB 0.76 s, 16-32 KB 4.2 s,
+/// 32-64 KB 12.1 s, 64-128 KB 15.1 s).
+fn big_bytes() -> usize {
+    static KB: OnceLock<usize> = OnceLock::new();
+    *KB.get_or_init(|| std::env::var("VICTORY_PIPELINE_BIG_KB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16)) << 10
+}
+
+/// The workers that may make big ones at once ([`small_first`]): all but 3
+/// (at least 1), or `VICTORY_PIPELINE_BIG_WORKERS`.
+fn big_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_BIG_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| worker_count().saturating_sub(3))
+            .max(1)
+    })
+}
+
+/// The workers [`workers`] starts: half the logical processors, 2 to 8.
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -297,7 +389,15 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
+        if small_first() {
+            tracing::info!(
+                workers,
+                big_workers = big_workers(),
+                big_kb = big_bytes() >> 10,
+                "host pipelines: small ones first, big compute programs on at most big_workers workers"
+            );
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -309,7 +409,17 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        let started = Instant::now();
+                        p.make();
+                        if small_first() && p.big {
+                            {
+                                let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                                queue.big_done();
+                            }
+                            AVAILABLE.notify_all();
+                            tracing::info!(shaders = ?p.shaders, ms = started.elapsed().as_millis() as u64, "big host pipeline made");
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -395,5 +505,64 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// A compute pipeline of a container of `kb` KB.
+    fn compute(kb: usize, fill: u8) -> Arc<Pending> {
+        Arc::new(Pending::new(vec![super::super::shader("compute", &vec![fill; kb << 10])], None))
+    }
+
+    #[test]
+    fn big_compute_programs_are_told_apart_by_size() {
+        assert!(compute(64, 1).big);
+        assert!(compute(16, 2).big);
+        assert!(!compute(15, 3).big);
+        assert!(!Arc::new(Pending::new(Vec::new(), None)).big);
+    }
+
+    /// With the split, requested small ones come before requested big ones,
+    /// those before early ones, and no more big ones than the cap are made
+    /// at once; without it, the order is the queue's.
+    #[test]
+    fn small_ones_go_first_and_big_ones_stay_within_the_cap() {
+        let (big_a, big_c) = (compute(64, 4), compute(32, 5));
+        let small_b = compute(1, 6);
+        let small_early = compute(2, 7);
+        let big_early = compute(20, 8);
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&big_a, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&small_b, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&big_c, REQUESTED, true), Some(true));
+        assert_eq!(queue.push_as(&small_early, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&big_early, EARLY, true), Some(true));
+
+        let cap = Some(1);
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &small_b), "the requested small one first");
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &big_a), "then a requested big one");
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &small_early), "the cap is reached: an early small one");
+        assert!(queue.pop_as(cap).is_none(), "only big ones left, and one is being made");
+        queue.big_done();
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &big_c), "room again: the next requested big one");
+        queue.big_done();
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &big_early));
+        assert!(queue.pop_as(cap).is_none());
+
+        // promoted from early to requested, a big one is taken once
+        let promoted = compute(48, 9);
+        assert_eq!(queue.push_as(&promoted, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&promoted, REQUESTED, true), Some(false));
+        queue.big_done();
+        assert!(Arc::ptr_eq(&queue.pop_as(cap).unwrap(), &promoted));
+        queue.big_done();
+        assert!(queue.pop_as(cap).is_none(), "its stale early entry is skipped");
+
+        // without the split: as queued
+        let (x, y) = (compute(64, 10), compute(1, 11));
+        let mut queue = Queue::new();
+        queue.push_as(&x, REQUESTED, false);
+        queue.push_as(&y, REQUESTED, false);
+        assert!(Arc::ptr_eq(&queue.pop_as(None).unwrap(), &x));
+        assert!(Arc::ptr_eq(&queue.pop_as(None).unwrap(), &y));
+        assert_eq!(queue.big_making, 0, "nothing counted without a cap");
     }
 }
