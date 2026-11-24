@@ -306,6 +306,161 @@ pub fn run(
     Ok(())
 }
 
+/// The warm-up (`--cache`): every distinct container found goes through
+/// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
+/// same code, so a run finds it translated or refused. With `pipelines`,
+/// then the shader pack's pipelines go into the pipeline library
+/// (`prebuild`).
+#[cfg(windows)]
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let dir = victory_core::Config::load()?.cache_subdir("shaders")?;
+    anyhow::ensure!(victory_gpu::shader_cache::prepare_host(), "no host D3D12 device");
+    anyhow::ensure!(victory_gpu::shader_cache::use_shader_cache(dir.clone()), "no shader cache in {}", dir.display());
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // The pre-build's key listing (diagnostics) translates nothing.
+    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
+        return crate::prebuild::run(&paths, threads);
+    }
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    // Containers already cached, translated now, refused now.
+    let counts = [const { AtomicUsize::new(0) }; 3];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let Some(bytes) = job.bytes() else { continue };
+                                // As the title passes it: the container's own size
+                                // (a raw source runs on to the end of the file).
+                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
+                                });
+                                let Some(container) = bytes.get(..size).filter(|c| c.len() >= 32) else {
+                                    continue;
+                                };
+                                let hash = blake3::hash(container);
+                                if !lock(&seen).insert(hash) {
+                                    continue;
+                                }
+                                let k = match victory_gpu::shader_cache::precompile_shader(container) {
+                                    Ok(true) => 0,
+                                    Ok(false) => 1,
+                                    Err(_) => 2,
+                                };
+                                counts[k].fetch_add(1, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                    .collect();
+                let [c, t, r] = &counts;
+                report(
+                    entry.path(),
+                    jobs.len(),
+                    "containers",
+                    &next,
+                    started,
+                    &workers,
+                    || {
+                        let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+                        format!(
+                            "; all files so far: {} cached, {} translated, {} refused",
+                            n(c),
+                            n(t),
+                            n(r)
+                        )
+                    },
+                );
+            });
+        }
+    }
+    let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);
+    let bytes: u64 = walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+    println!("cache        {} ({} MB)", dir.display(), bytes >> 20);
+    println!(
+        "containers   {} in {:.1} s: {cached} already cached, {translated} translated, {refused} refused",
+        cached + translated + refused,
+        started.elapsed().as_secs_f64()
+    );
+    if pipelines {
+        crate::prebuild::run(&paths, threads)?;
+    }
+    Ok(())
+}
+
+/// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
+/// hands them out) until they finish: on a terminal one line rewritten
+/// every second, else a line every 10 s; then the file's last line.
+#[cfg(windows)]
+pub(crate) fn report<T>(
+    file: &Path,
+    jobs: usize,
+    what: &str,
+    next: &AtomicUsize,
+    started: std::time::Instant,
+    workers: &[std::thread::ScopedJoinHandle<'_, T>],
+    extra: impl Fn() -> String,
+) {
+    use std::io::IsTerminal;
+    if workers.is_empty() {
+        return;
+    }
+    let terminal = std::io::stderr().is_terminal();
+    let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
+    let line = || {
+        // `next` counts jobs handed out; a worker still running holds one.
+        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+        let taken = next.load(Ordering::Relaxed).min(jobs);
+        let done = taken.saturating_sub(busy);
+        format!(
+            "{}: {done} of {jobs} {what} ({}%), {:.0} s{}",
+            file.display(),
+            done * 100 / jobs.max(1),
+            started.elapsed().as_secs_f64(),
+            extra()
+        )
+    };
+    let mut shown = std::time::Instant::now();
+    while !workers.iter().all(|w| w.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if shown.elapsed() >= every {
+            shown = std::time::Instant::now();
+            if terminal {
+                eprint!("\r{}", line());
+            } else {
+                eprintln!("{}", line());
+            }
+        }
+    }
+    eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
+}
+
+#[cfg(not(windows))]
+pub fn warm(_: Vec<PathBuf>, _: Option<usize>, _: bool) -> Result<()> {
+    anyhow::bail!("precompiling shaders requires Windows D3D12")
+}
+
 fn translate(
     source: &Source,
     path: &Path,
