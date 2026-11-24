@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -267,11 +267,20 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// The same views page by page, from the section's side: (section,
+    /// offset of the page in it, address that shows it). A page the title
+    /// maps twice (its pool, and its tiled heap after a page-mapping copy)
+    /// has two entries; the texture guard needs both (`crate::watch`).
+    shown: BTreeSet<(usize, u64, usize)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views {
+    views: BTreeMap::new(),
+    shown: BTreeSet::new(),
+    sections: Vec::new(),
+});
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -288,7 +297,33 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let pairs = {
+        let mut v = views();
+        if let Some(old) = v.views.insert(at, (len, section, offset)) {
+            forget_pages(&mut v.shown, at, old);
+        }
+        for k in 0..len.div_ceil(K64) {
+            v.shown
+                .insert((section, offset + (k * K64) as u64, at + k * K64));
+        }
+        aliases_in(&v, at, len)
+    };
+    // Pages shown elsewhere already: a guarded texture there must see
+    // writes through this view as well.
+    if !pairs.is_empty() {
+        crate::watch::aliases_mapped(&pairs);
+    }
+}
+
+/// Takes the pages of view `(len, section, offset)` at `at` out of `shown`.
+fn forget_pages(
+    shown: &mut BTreeSet<(usize, u64, usize)>,
+    at: usize,
+    (len, section, offset): (usize, usize, u64),
+) {
+    for k in 0..len.div_ceil(K64) {
+        shown.remove(&(section, offset + (k * K64) as u64, at + k * K64));
+    }
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -303,8 +338,71 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        if let Some(view) = v.views.remove(&base) {
+            forget_pages(&mut v.shown, base, view);
+        }
     }
+}
+
+/// The pages of `[at, at + len)` that another view shows as well: `(here,
+/// there)`, the address of the page in the range and of the same page in
+/// the other view, page by page.
+pub(crate) fn aliases(at: usize, len: usize) -> Vec<(usize, usize)> {
+    aliases_in(&views(), at, len)
+}
+
+fn aliases_in(v: &Views, at: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let end = at.saturating_add(len);
+    let first = v
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| *base + view.0 > at);
+    for (&base, &(bytes, section, offset)) in first
+        .into_iter()
+        .chain(v.views.range(at.saturating_add(1)..end))
+    {
+        let from = at.max(base) - base;
+        let to = end.min(base + bytes) - base;
+        for k in from / K64..to.div_ceil(K64) {
+            let (page, here) = (offset + (k * K64) as u64, base + k * K64);
+            for &(_, _, there) in v
+                .shown
+                .range((section, page, 0)..=(section, page, usize::MAX))
+            {
+                if there != here {
+                    pairs.push((here, there));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// The title memory that shows bytes `[offset, offset + len)` of
+/// `section`: `(address, bytes)` pieces, in address order, those that
+/// continue each other joined.
+pub(crate) fn showing(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    let end = offset.saturating_add(len as u64);
+    let first = offset - offset % K64 as u64;
+    let mut pieces: Vec<(usize, usize)> = views()
+        .shown
+        .range((section, first, 0)..(section, end, 0))
+        .filter_map(|&(_, page, at)| {
+            let (from, to) = (offset.max(page), end.min(page + K64 as u64));
+            (from < to).then(|| (at + (from - page) as usize, (to - from) as usize))
+        })
+        .collect();
+    pieces.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for (at, bytes) in pieces {
+        match joined.last_mut() {
+            Some((last, n)) if *last + *n == at => *n += bytes,
+            _ => joined.push((at, bytes)),
+        }
+    }
+    joined
 }
 
 /// How the views cover `[at, at + len)`.
@@ -1055,6 +1153,36 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// Pages mapped at two addresses are found from either, and from the
+    /// section's side; gone with their views.
+    #[test]
+    fn pages_shown_twice_are_found_from_both_sides() {
+        let (pool, heap) = (0x7_A000_0000usize, 0x7_B000_0000usize);
+        title_memory_view(pool, 4 * K64, 78, 8 * K64 as u64);
+        // The pool's second and third pages, in the tiled heap one by one.
+        title_memory_view(heap + K64, K64, 78, 10 * K64 as u64);
+        title_memory_view(heap, K64, 78, 9 * K64 as u64);
+        assert_eq!(
+            aliases(heap, 2 * K64),
+            [(heap, pool + K64), (heap + K64, pool + 2 * K64)]
+        );
+        assert_eq!(
+            aliases(pool, 4 * K64),
+            [(pool + K64, heap), (pool + 2 * K64, heap + K64)]
+        );
+        assert_eq!(aliases(pool + 3 * K64, K64), []);
+        // Bytes from the middle of the section's 9th page into its 10th.
+        assert_eq!(
+            showing(78, 9 * K64 as u64 + 100, K64),
+            [(pool + K64 + 100, K64), (heap + 100, K64)]
+        );
+        views_gone(heap, 2 * K64);
+        assert_eq!(aliases(pool, 4 * K64), []);
+        assert_eq!(showing(78, 9 * K64 as u64, 1), [(pool + K64, 1)]);
+        views_gone(pool, 4 * K64);
+        assert_eq!(showing(78, 0, 16 * K64), []);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

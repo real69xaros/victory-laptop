@@ -5766,10 +5766,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
-    }
+    // The kernel writes the destination: it must not be guarded, nor
+    // guarded again meanwhile.
+    let _writing = title_dst.then(|| crate::watch::writing_held(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -5892,18 +5891,24 @@ fn direct_writes() -> bool {
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not mapped alone. The destination's
+/// guards are opened, and held open until the write is done.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return;
+    }
+    // The kernel writes nothing read-only, and a guard taken meanwhile on
+    // another thread (a texture showing these pages) would make it so.
+    let _writing = crate::watch::writing_held(dst as usize, len);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and
-            // writes nothing it cannot (the caller opened its guards:
-            // `crate::watch::writing`).
+            // writes nothing it cannot (its guards are open: above).
             return unsafe {
                 NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
             };
@@ -5912,7 +5917,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
