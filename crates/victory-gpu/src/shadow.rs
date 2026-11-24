@@ -84,8 +84,10 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. `None` for a lean
+    /// window ([`lean_windows`]): it has no CPU side, `data` is null, and
+    /// what changed goes to the card straight from title memory.
+    staging: Option<ID3D12Resource>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -101,6 +103,49 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// A lean window's buffer when it is reserved (`Host::reserved_buffer`):
+    /// per 64 KiB tile, the pool's tile mapped there (heap, tile), if any.
+    /// Tiles are mapped as bytes are first sent there; one never sent reads
+    /// as zeros, as a fresh buffer did.
+    tiles: Option<Mutex<Vec<Option<(u32, u32)>>>>,
+}
+
+/// The 64 KiB tiles (`crate::host::TILE`) that offsets `ranges` of a copy
+/// touch, in order, each once.
+fn tiles_of(ranges: &[(usize, usize)]) -> Vec<u32> {
+    let tile = crate::host::TILE as usize;
+    let mut tiles: Vec<u32> = ranges
+        .iter()
+        .filter(|&&(a, b)| a < b)
+        .flat_map(|&(a, b)| (a / tile) as u32..=((b - 1) / tile) as u32)
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    tiles
+}
+
+#[cfg(test)]
+mod tiles_tests {
+    use super::tiles_of;
+    const T: usize = 64 << 10;
+
+    /// A range inside one tile touches that tile; one across a boundary,
+    /// both; the end is not included.
+    #[test]
+    fn ranges_touch_the_tiles_they_cover() {
+        assert_eq!(tiles_of(&[(10, 20)]), vec![0]);
+        assert_eq!(tiles_of(&[(T - 1, T + 1)]), vec![0, 1]);
+        assert_eq!(tiles_of(&[(T, 2 * T)]), vec![1]);
+        assert_eq!(tiles_of(&[(0, 4 * T)]), vec![0, 1, 2, 3]);
+    }
+
+    /// Several ranges: each tile once, in order; empty ranges touch none.
+    #[test]
+    fn tiles_come_once_and_in_order() {
+        assert_eq!(tiles_of(&[(3 * T, 3 * T + 5), (0, 1), (3 * T + 9, 4 * T + 1), (7, 7)]), vec![0, 3, 4]);
+        assert!(tiles_of(&[]).is_empty());
+        assert!(tiles_of(&[(5, 5)]).is_empty());
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -245,16 +290,98 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        // Lean windows only save the PC's memory on the card: they default
+        // to as much of it as the room rule in `window_card_for` leaves.
+        let default = if lean_windows() { LEAN_WINDOWS_MB } else { 0 };
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
     })
+}
+
+/// [`window_card_most`] with [`lean_windows`] and no `VICTORY_CARD_WINDOWS_MB`.
+const LEAN_WINDOWS_MB: u64 = 8192;
+
+/// Whether windows on the card keep no CPU side (`VICTORY_LEAN_WINDOWS=1`;
+/// off by default).
+///
+/// A window on the card ([`window_card_most`]) kept its whole 4 MiB CPU
+/// side in the PC's memory: title memory was copied into it and what changed
+/// went up from there. So a window cost the PC's memory and the card's. The
+/// windows were 2.2-3.0 GB of a 32 GB PC's commit in the world (fork issue
+/// #54: 700 windows, 2,988 MB, at 19.7 GB private), and the commit ran out at
+/// 23.4 GB private with the page file Windows was given.
+///
+/// With the switch a window on the card has no CPU side: a refresh only notes
+/// which bytes changed ([`Shadow::copy`]), and before the submission those
+/// bytes go from title memory through a small upload buffer of the host's to
+/// the card (`Host::card_before`), so the PC holds the upload buffers alone.
+/// Windows that find no room on the card stay as they were.
+///
+/// What it assumes: shaders write no window (run 91 of the fork's notes: "0.0
+/// MB compared in 0 ranges of windows"), since a write back to title memory
+/// needs the CPU side to tell the card's bytes from the title's. A write
+/// declared for a lean window is not compared or copied back; it is counted
+/// in the lean line instead. The ray-tracing structure builder declares
+/// writes for every copy it can reach, so `VICTORY_BVH_BUILDER=1` turns lean
+/// windows off.
+pub(crate) fn lean_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_LEAN_WINDOWS").is_some_and(|v| v == "1");
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if asked && builder {
+            tracing::warn!("VICTORY_LEAN_WINDOWS is off: the ray-tracing structure builder (VICTORY_BVH_BUILDER) writes windows");
+        }
+        asked && !builder
+    })
+}
+
+/// Lean windows ([`lean_windows`]): made, bytes alive, bytes sent from title
+/// memory to the card since the last lean line, writes declared for them and
+/// left out since the start, plans whose upload ran in parts since the last
+/// line (each part waited for).
+static LEAN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Bytes of title memory that `Host::card_before` sent straight to a lean
+/// window's card side.
+pub(crate) fn lean_sent(bytes: u64) {
+    LEAN[2].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `Host::card_before` filled its upload buffer and waited for the card to
+/// take it before filling it again.
+pub(crate) fn lean_part() {
+    LEAN[4].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The lean windows' line, with the frame line's others (`crate::host`).
+pub(crate) fn lean_line() {
+    if !lean_windows() {
+        return;
+    }
+    let mb = |v: u64| v as f64 / (1 << 20) as f64;
+    let (heaps, mapped) = crate::host::tile_bytes();
+    tracing::info!(
+        "lean windows (VICTORY_LEAN_WINDOWS): {} made, {:.0} MB alive on the card with no CPU side, of it {:.0} MB in \
+         tiles mapped ({:.0} MB of heaps for tiles); {:.1} MB sent up from title memory since the last line, {} times \
+         a full upload buffer waited for; {} declared writes left out since the start",
+        LEAN[0].load(Ordering::Relaxed),
+        mb(LEAN[1].load(Ordering::Relaxed)),
+        mb(mapped),
+        mb(heaps),
+        mb(LEAN[2].swap(0, Ordering::Relaxed)),
+        LEAN[4].swap(0, Ordering::Relaxed),
+        LEAN[3].load(Ordering::Relaxed),
+    );
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
-/// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+/// be there ([`window_card_most`]), and whether it is reserved: with
+/// `reserve` (a lean window) one the host maps tiles into as they are used,
+/// if the card can (`Host::reserved_buffer`), else a whole one.
+fn window_card_for(size: u64, reserve: bool) -> Option<(ID3D12Resource, bool)> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -272,11 +399,14 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
+    let made = match reserve.then(|| host.reserved_buffer(size)).flatten() {
+        Some(reserved) => Some((reserved, true)),
+        None => host.uav_buffer(size).map(|whole| (whole, false)),
+    };
+    if made.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    made
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
@@ -1400,6 +1530,13 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if let Some(card) = &mut self.card {
+            if card.staging.is_none() {
+                LEAN[1].fetch_sub(card.size, Ordering::Relaxed);
+            }
+            if let Some(tiles) = card.tiles.take() {
+                let tiles = tiles.into_inner().unwrap_or_else(|e| e.into_inner());
+                crate::host::give_back_tiles(tiles.into_iter().flatten());
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -1751,8 +1888,58 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // A lean window has no CPU side to compare with ([`lean_windows`]):
+        // the write is counted, not declared.
+        if self.lean() {
+            LEAN[3].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// A window on the card with no CPU side ([`lean_windows`]).
+    pub(crate) fn lean(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.staging.is_none())
+    }
+
+    /// Before bytes at offsets `ranges` go to a lean window's reserved
+    /// buffer: the tiles they touch that have none mapped get one of the
+    /// pool's (`take`: so many tiles, or `None`), returned as (tile, (heap,
+    /// heap tile)) for the caller to map ahead of the copy. Empty for a
+    /// buffer that is not reserved. Without tiles from the pool the bytes
+    /// sent to those tiles are dropped by the card and read as zeros.
+    pub(crate) fn tiles_to_map(
+        &self,
+        ranges: &[(usize, usize)],
+        take: impl FnOnce(usize) -> Option<Vec<(u32, u32)>>,
+    ) -> Vec<(u32, (u32, u32))> {
+        let Some(tiles) = self.card.as_ref().and_then(|c| c.tiles.as_ref()) else {
+            return Vec::new();
+        };
+        let mut tiles = tiles.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted: Vec<u32> = tiles_of(ranges)
+            .into_iter()
+            .filter(|&t| tiles.get(t as usize).is_some_and(Option::is_none))
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let Some(taken) = take(wanted.len()) else {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!("lean windows: no tiles for a window's bytes; they read as zeros");
+            }
+            return Vec::new();
+        };
+        wanted
+            .into_iter()
+            .zip(taken)
+            .map(|(t, pooled)| {
+                tiles[t as usize] = Some(pooled);
+                (t, pooled)
+            })
+            .collect()
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -1764,7 +1951,8 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        // (A lean window's writes are never declared: `gpu_writes`.)
+        if self.place.is_some() || self.lean() {
             return;
         }
         let range = (address, address + len);
@@ -2454,6 +2642,12 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // A lean window has no CPU side: the bytes go from title memory to
+        // the card before the submission (`Host::card_before`).
+        if self.lean() {
+            self.card_changed(from - start, to - start);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -2485,12 +2679,13 @@ impl Shadow {
         }
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory; `None` for
+    /// a lean window, whose bytes come from title memory itself), the card
+    /// side's bytes from before if made yet, and their size.
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.as_ref(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -2805,11 +3000,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: Some(buffer),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    tiles: None,
                 };
                 (on_card, Some(card))
             }
@@ -3013,23 +3209,50 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+    // A lean window ([`lean_windows`]): the card's buffer alone, no CPU side.
+    // Reserved where the card can: only the tiles bytes are sent to cost memory.
+    let lean = lean_windows()
+        .then(|| window_card_for(len, true))
+        .flatten()
+        .map(|(on_card, reserved)| {
+            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card, lean"));
+            LEAN[0].fetch_add(1, Ordering::Relaxed);
+            LEAN[1].fetch_add(len, Ordering::Relaxed);
+            let tiles = reserved.then(|| Mutex::new(vec![None; len.div_ceil(crate::host::TILE) as usize]));
             let card = Card {
-                staging: buffer,
+                staging: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                tiles,
             };
-            (on_card, Some(card))
+            (on_card, std::ptr::null_mut(), Some(card))
+        });
+    let (buffer, data, card) = match lean {
+        Some(lean) => lean,
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            // With room for windows on the card (`window_card_most`):
+            // shaders get a buffer there, and the one just made is the
+            // CPU's side.
+            match window_card_for(len, false) {
+                Some((on_card, _)) => {
+                    crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                    let card = Card {
+                        staging: Some(buffer),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size: len,
+                        tiles: None,
+                    };
+                    (on_card, data, Some(card))
+                }
+                None => (buffer, data, None),
+            }
         }
-        None => (buffer, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
