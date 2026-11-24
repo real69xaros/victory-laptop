@@ -142,10 +142,14 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-To warm the runtime shader cache before running the title, use the same
-release executable for both commands. `--pipelines` also stores supported
-pipelines from the shader pack in the host D3D12 library. The library is
-specific to the host GPU and driver.
+Use the same cache directory and translation settings for warm-up and
+play. Shader entries survive rebuilds outside the translator and its build
+inputs. Changes to the translator or GPU shader capabilities select new
+entries. Unsupported shader results are cached under the same rules.
+`--pipelines` also stores supported pipelines from the shader pack
+in the host D3D12 library, which is specific to the host GPU and driver.
+Add `--used-pipelines` to prebuild only exact pipeline keys requested by
+earlier runs in that cache. The shader warm-up still covers all input files.
 
 ```powershell
 target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
@@ -182,7 +186,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
+victory translate [paths...] --cache [--pipelines [--used-pipelines]] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config

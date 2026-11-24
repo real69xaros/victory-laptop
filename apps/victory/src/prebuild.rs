@@ -11,13 +11,13 @@
 //! counted by cause and skipped. The library is saved as it grows: an
 //! interrupted pre-build keeps the last saved batch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_game::pipelines::{self, Named, Unnamed};
 use victory_game::{sgd5, shaderpack};
 use victory_gpu::pipeline::{self, Prebuild};
@@ -35,9 +35,40 @@ enum Job {
     Compute(usize),
 }
 
-pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
+pub fn run(paths: &[PathBuf], threads: usize, used_pipelines: bool) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    let dir = victory_core::Config::load()?.cache_subdir("pipelines")?;
+    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS");
+    let requested = if used_pipelines && keys_only.is_none() {
+        let history = dir.join("early-pipelines.txt");
+        let listed = match std::fs::read_to_string(&history) {
+            Ok(listed) => listed,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "pipelines    no recorded requests at {}; nothing to prebuild",
+                    history.display(),
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error).with_context(|| format!("reading {}", history.display())),
+        };
+        let keys: HashSet<String> = listed
+            .lines()
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if keys.is_empty() {
+            println!(
+                "pipelines    recorded request list is empty at {}; nothing to prebuild",
+                history.display(),
+            );
+            return Ok(());
+        }
+        Some(keys)
+    } else {
+        None
+    };
+    pipeline::use_pipeline_cache(dir);
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
@@ -175,7 +206,6 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // record's key (what a run lists pipelines by) with its shaders and
     // state as a run's `VICTORY_PIPELINE_LOG` has them, or why it is
     // skipped; and the records each source named states for.
-    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS");
     if keys_only.is_some() {
         let mut by: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for g in &graphics {
@@ -198,11 +228,26 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // in an earlier run, and let the host library check each description.
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
+    let matched = Mutex::new(HashSet::new());
+    let unrequested = AtomicUsize::new(0);
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
+        Ok(p) => {
+            let key = p.key();
+            if let Some(requested) = &requested {
+                if !requested.contains(&key) {
+                    unrequested.fetch_add(1, Ordering::Relaxed);
+                } else if lock(&matched).insert(key) {
+                    lock(&todo).push((false, job));
+                } else {
+                    skip("duplicate requested pipeline key".into());
+                }
+            } else {
+                lock(&todo).push((!pipeline::wanted_early(&key), job));
+            }
+        }
         Err(why) => {
             if keys_only.is_some() {
                 lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
@@ -216,6 +261,21 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
+    if let Some(requested) = &requested {
+        if todo.is_empty() {
+            println!(
+                "pipelines    none of {} recorded keys matched a reconstructable shader-pack pipeline; nothing to prebuild",
+                requested.len(),
+            );
+        } else {
+            println!(
+                "pipelines    matched {} of {} recorded keys; {} pack records were not requested",
+                todo.len(),
+                requested.len(),
+                unrequested.into_inner(),
+            );
+        }
+    }
 
     let next = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();

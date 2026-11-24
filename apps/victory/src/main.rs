@@ -83,6 +83,9 @@ enum Command {
         /// Check host pipelines, or prebuild the shader pack's pipelines with --cache.
         #[arg(long)]
         pipelines: bool,
+        /// Prebuild only shader-pack pipelines requested by earlier runs in this cache.
+        #[arg(long, requires_all = ["cache", "pipelines"])]
+        used_pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -155,9 +158,14 @@ fn main() -> Result<()> {
             disasm,
             effects,
         } => shader::run(paths, verbose || disasm, disasm, effects),
-        Command::Translate { paths, jobs, pipelines, cache: true, .. } => {
-            translate::warm(paths, jobs, pipelines)
-        }
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            used_pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs, pipelines, used_pipelines),
         Command::Translate {
             paths,
             validate,
@@ -165,6 +173,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            ..
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
