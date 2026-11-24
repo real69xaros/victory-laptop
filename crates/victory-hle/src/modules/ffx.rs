@@ -60,6 +60,9 @@ struct Upscale {
 const _: () = assert!(size_of::<Resource>() == 48);
 const _: () = assert!(std::mem::offset_of!(Upscale, output) == 0x138);
 
+/// `FFX_API_RETURN_ERROR`: what a dispatch nothing could answer returns.
+const ERROR: u32 = 1;
+
 /// `FFX_API_DISPATCH_DESC_TYPE_UPSCALE`.
 const UPSCALE: u64 = 0x0001_0001;
 
@@ -106,9 +109,57 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
         }
     }
     match REAL.load(Ordering::Relaxed) {
-        0 => 0,
+        // Neither stretched nor passed on: the output was not written, and
+        // the title is told so instead of presenting it as it is.
+        0 => {
+            static TOLD: std::sync::Once = std::sync::Once::new();
+            TOLD.call_once(|| {
+                tracing::error!(
+                    "a FidelityFX dispatch was not answered: no stretch was recorded and the title's own ffxDispatch was not found"
+                );
+            });
+            ERROR
+        }
         // SAFETY: the title's own `ffxDispatch`, with its own arguments.
         real => unsafe { std::mem::transmute::<usize, Dispatch>(real)(context, desc) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+
+    /// The upscale description as the public API lays it out: what the
+    /// stretch reads sits where the title wrote it.
+    #[test]
+    fn the_upscale_description_is_laid_out_as_the_public_api() {
+        assert_eq!(size_of::<Header>(), 16);
+        assert_eq!(offset_of!(Upscale, list), 0x10);
+        assert_eq!(offset_of!(Upscale, colour), 0x18);
+        assert_eq!(offset_of!(Upscale, depth), 0x48);
+        assert_eq!(offset_of!(Upscale, motion), 0x78);
+        assert_eq!(offset_of!(Upscale, output), 0x138);
+        assert_eq!(offset_of!(Upscale, jitter), 0x168);
+        assert_eq!(offset_of!(Upscale, motion_scale), 0x170);
+        assert_eq!(offset_of!(Upscale, render), 0x178);
+        assert_eq!(offset_of!(Upscale, upscale), 0x180);
+        assert_eq!(offset_of!(Resource, description), 8);
+        assert_eq!(offset_of!(Resource, state), 40);
+    }
+
+    /// A dispatch that is not an upscale, with no DLL of the title's to
+    /// pass it to, is an error and not a silent success.
+    #[test]
+    fn a_dispatch_nothing_answers_is_an_error() {
+        let before = REAL.swap(0, Ordering::Relaxed);
+        let other = Header {
+            kind: 0x0002_0001,
+            next: std::ptr::null(),
+        };
+        assert_eq!(dispatch(std::ptr::null_mut(), &other), ERROR);
+        assert_eq!(dispatch(std::ptr::null_mut(), std::ptr::null()), ERROR);
+        REAL.store(before, Ordering::Relaxed);
     }
 }
 

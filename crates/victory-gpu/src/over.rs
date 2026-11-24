@@ -38,6 +38,11 @@ float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
 
 /// Views kept until the list that uses them has run: a present can be sent
 /// ahead of the card, so a view is not reused for this many presents.
+///
+/// shortcut: a fixed count, not derived from how many presents are in
+/// flight. Presents sent ahead each hold a back buffer and the swap chain
+/// has two, so no more than a few lists are ever waiting; 16 is well past
+/// that.
 const RING: u32 = 16;
 
 struct Pass {
@@ -243,6 +248,11 @@ SamplerState bilinear : register(s0);
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void stretch(uint3 id : SV_DispatchThreadID) {
+    // Groups are 8 by 8: the last ones reach past a size that is not a
+    // multiple of 8.
+    uint width, height;
+    target.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
     float2 at = (float2(id.xy) + 0.5) * texel * scale;
     target[id.xy] = source.SampleLevel(bilinear, at, 0);
 }
@@ -259,9 +269,13 @@ struct Stretch {
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Stretch {}
 
-static STRETCHER: Mutex<Option<Option<Stretch>>> = Mutex::new(None);
+static STRETCHER: Mutex<Option<Stretch>> = Mutex::new(None);
 
 /// Views of a stretch are kept this many stretches (two views each).
+///
+/// shortcut: a fixed count. The title dispatches the upscaler once a frame
+/// and a list runs within the frames the title keeps in flight; 64 frames
+/// is far more than it keeps.
 const STRETCH_RING: u32 = 64;
 
 fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
@@ -331,17 +345,24 @@ pub(crate) fn record_stretch(
         return false;
     }
     let mut made = STRETCHER.lock().unwrap_or_else(|e| e.into_inner());
-    let pass = made.get_or_insert_with(|| match make_stretch(device) {
-        Ok(p) => {
-            tracing::info!("the upscaler's output is made by a plain stretch of its colour input");
-            Some(p)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "no pass to stretch the upscaler's input: its output stays as it is");
-            None
-        }
-    });
-    let Some(p) = pass.as_mut() else { return false };
+    if made.is_none() {
+        // Tried again at the next dispatch if it fails, as the pass over a
+        // present is: a failure need not last.
+        *made = match make_stretch(device) {
+            Ok(p) => {
+                tracing::info!("the upscaler's output is made by a plain stretch of its colour input");
+                Some(p)
+            }
+            Err(e) => {
+                static TOLD: std::sync::Once = std::sync::Once::new();
+                TOLD.call_once(|| {
+                    tracing::warn!(error = %e, "no pass to stretch the upscaler's input: its output stays as it is");
+                });
+                None
+            }
+        };
+    }
+    let Some(p) = made.as_mut() else { return false };
     let slot = (p.next % STRETCH_RING) * 2;
     p.next = p.next.wrapping_add(1);
     let (width, height) = (to.Width as u32, to.Height);
@@ -391,4 +412,31 @@ pub(crate) fn record_stretch(
         list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Typeless colour formats are read and written as their typed ones;
+    /// typed formats, and formats with no typeless form here, stay.
+    #[test]
+    fn typeless_formats_get_their_typed_one() {
+        for (typeless, typed_one) in [(1, 2), (9, 10), (23, 24), (27, 28)] {
+            assert_eq!(typed(DXGI_FORMAT(typeless)).0, typed_one);
+            assert_eq!(typed(DXGI_FORMAT(typed_one)).0, typed_one);
+        }
+        // R11G11B10_FLOAT, R8G8B8A8_UNORM_SRGB and the FP16 stand-in's own.
+        for format in [26, 29, 10, 0] {
+            assert_eq!(typed(DXGI_FORMAT(format)).0, format);
+        }
+    }
+
+    /// The stretch's source guards its writes: groups of 8 reach past sizes
+    /// that are not multiples of 8.
+    #[test]
+    fn the_stretch_writes_inside_its_target_only() {
+        assert!(STRETCH.contains("numthreads(8, 8, 1)"));
+        assert!(STRETCH.contains("if (id.x >= width || id.y >= height) return;"));
+    }
 }
