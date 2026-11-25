@@ -373,29 +373,82 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+    ///
+    /// Counts for the frame line cover the whole queue: queued, due, waiting
+    /// for memory, partly uploaded and the wait of the oldest due write.
+    fn due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        if self.slots.is_empty() {
+            return (Vec::new(), [0; 5]);
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        let mut census = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            let retry = w.mapped > 0 || w.looks > 0;
+            if w.mapped > 0 {
+                census[3] += 1;
+            } else if w.looks > 0 {
+                census[2] += 1;
+            }
+            if w.due > frame {
+                continue;
+            }
+            census[1] += 1;
+            census[4] = census[4].max(frame.saturating_sub(w.written));
+            if max > 0 && retry {
+                again.push((index, w.write));
+            } else if again.len() < max {
+                fresh.push((index, w.write));
             }
         }
-        order.truncate(max);
-        order
+        let retries = again.len().min(max);
+        Self::sort_ends(&mut again, retries, 0);
+        again.truncate(retries);
+        // The draw holds the result while staging textures. Release scratch
+        // space for discarded retries before returning the selection.
+        again.shrink_to(max);
+        let remaining = fresh.len().min(max - retries);
+        let (newest, oldest) = (remaining.div_ceil(2), remaining / 2);
+        Self::sort_ends(&mut fresh, newest, oldest);
+        again.reserve_exact(remaining);
+        for i in 0..newest {
+            again.push(fresh[i]);
+            if i < oldest {
+                again.push(fresh[fresh.len() - 1 - i]);
+            }
+        }
+        (again, census)
+    }
+
+    /// Order only the newest and oldest writes that can fit in this pass.
+    /// The unselected middle can stay in any order.
+    fn sort_ends(slots: &mut [(u32, u64)], newest: usize, oldest: usize) {
+        if newest + oldest == 0 {
+            return;
+        }
+        let by_write = |&(_, write): &(u32, u64)| std::cmp::Reverse(write);
+        if newest + oldest == slots.len() {
+            slots.sort_unstable_by_key(by_write);
+            return;
+        }
+        // Sequential writes often follow the descriptor indices in either
+        // direction. Avoid partitioning (and scrambling) these ordered runs.
+        if slots.is_sorted_by_key(by_write) {
+            return;
+        }
+        if slots.is_sorted_by_key(|&(_, write)| write) {
+            slots.reverse();
+            return;
+        }
+        let old_start = slots.len() - oldest;
+        if newest > 0 {
+            slots.select_nth_unstable_by_key(newest, by_write);
+            slots[..newest].sort_unstable_by_key(by_write);
+        }
+        if oldest > 0 {
+            slots[newest..].select_nth_unstable_by_key(old_start - newest, by_write);
+            slots[old_start..].sort_unstable_by_key(by_write);
+        }
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -485,25 +538,6 @@ impl TextureQueue {
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
-    }
-
-    /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
-            }
-        }
-        c
     }
 }
 
@@ -915,10 +949,10 @@ impl HostHeap {
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
+    /// for the frame line.
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due(frame, max)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -2646,37 +2680,37 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100).0.into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.due(9, 2).0.len(), 2);
+        assert_eq!(q.due(9, 0).1, [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).0.iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100).0.iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100).0[0].0, 17);
         }
-        assert_eq!(q.census(9)[2], 1);
+        assert_eq!(q.due(9, 0).1[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100).0.iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100).0[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100).0[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -2684,11 +2718,62 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100).0.iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100).0.iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100).0.iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn bounded_texture_pass_keeps_retry_order_and_full_queue_counts() {
+        let mut q = TextureQueue::default();
+        // Distinct generations in a different order from the descriptor slots.
+        let ids = [45, 12, 77, 31, 63, 4, 82, 19, 18, 26, 10, 52];
+        for (i, &id) in ids.iter().enumerate() {
+            q.written(id, i as u64, 0, false);
+        }
+        q.later(77, 3, 11, 8);
+        q.partly(63, 5, 12, 16);
+        q.partly(19, 8, 14, 16);
+        q.later(10, 11, 12, 8);
+        q.changed(45, 12, 13);
+        q.done(45, 1); // The completion of the previous generation is stale.
+        let order = [
+            (63, 5), (77, 3), // Due retries, newest write first.
+            (45, 13), (12, 2), (52, 12), (31, 4), (26, 10),
+            (4, 6), (18, 9), (82, 7),
+        ];
+        for max in 0..=order.len() + 1 {
+            let (selected, counts) = q.due(12, max);
+            assert_eq!(selected, &order[..order.len().min(max)]);
+            assert_eq!(counts, [12, 10, 2, 2, 11]);
+        }
+        // The deferred retry and the partial upload keep their generation.
+        assert_eq!(q.due(13, 1).0, [(10, 11)]);
+        assert_eq!(q.due(14, 3).0, [(10, 11), (19, 8), (63, 5)]);
+    }
+
+    #[test]
+    fn texture_pass_preserves_both_ends_of_sequential_writes_at_capacity() {
+        const MAX: usize = 4096; // The per-pass limit in draw::heap_textures.
+        const SLOTS: u32 = MAX as u32 + 1;
+        for reverse in [false, true] {
+            let mut q = TextureQueue::default();
+            for i in 0..SLOTS {
+                let index = if reverse { SLOTS - 1 - i } else { i };
+                q.written(index, 0, 0, false);
+            }
+            let (selected, census) = q.due(0, MAX);
+            assert_eq!(selected.len(), MAX);
+            assert_eq!(census, [SLOTS.into(), SLOTS.into(), 0, 0, 0]);
+            for (i, &(index, write)) in selected.iter().enumerate() {
+                let end = (i / 2) as u32;
+                let written = if i % 2 == 0 { SLOTS - 1 - end } else { end };
+                assert_eq!(write, u64::from(written) + 1);
+                assert_eq!(index, if reverse { SLOTS - 1 - written } else { written });
+            }
+        }
     }
 
     /// A view written over memory that older views describe otherwise

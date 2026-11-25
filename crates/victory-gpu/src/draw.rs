@@ -366,7 +366,7 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
-/// (`TextureQueue::census`): slots in it, due, waiting for their memory,
+/// (`TextureQueue::due`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Since the start: looks at a slot uploaded in part that found no more of
