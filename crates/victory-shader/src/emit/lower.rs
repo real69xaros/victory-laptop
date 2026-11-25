@@ -822,6 +822,106 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// An LDS access as [`lds_meetings`] orders it.
+#[derive(Clone, PartialEq, Debug)]
+enum LdsUse {
+    Read,
+    Write,
+    /// An atomic whose result in memory does not depend on the order the lanes run it, by
+    /// operation and type (`ds_add_u32` and `ds_add_rtn_u32` are one kind).
+    Atomic(String),
+}
+
+fn lds_use(name: &str) -> LdsUse {
+    if name.starts_with("ds_read") {
+        return LdsUse::Read;
+    }
+    let rest = name.strip_prefix("ds_").unwrap_or(name);
+    let op = rest.split('_').next().unwrap_or("");
+    if matches!(op, "add" | "sub" | "min" | "max" | "and" | "or" | "xor") && !rest.contains("src2") {
+        return LdsUse::Atomic(rest.replace("_rtn", ""));
+    }
+    LdsUse::Write
+}
+
+/// Per value, the instruction that writes it (for [`lds_dwords`]).
+fn lds_value_defs(p: &crate::ir::Program) -> HashMap<Value, &Inst> {
+    let mut defs = HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            for &(_, v) in &inst.writes {
+                defs.insert(v, inst);
+            }
+        }
+    }
+    defs
+}
+
+/// The value `v` holds in every lane when a plain move of a constant wrote it.
+fn lds_constant(defs: &HashMap<Value, &Inst>, v: Value) -> Option<u32> {
+    let inst = defs.get(&v)?;
+    if !matches!(inst.name(), "v_mov_b32" | "s_mov_b32") {
+        return None;
+    }
+    let src = match &inst.fields {
+        Fields::Valu(x) if x.dpp.is_none() && x.sdwa.is_none() => x.src.first().cloned()?,
+        Fields::Sop { src, .. } => src.first().cloned()?,
+        _ => return None,
+    };
+    match src {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// The dwords of LDS an access touches, when its address is a constant; `None` if not known.
+fn lds_dwords(defs: &HashMap<Value, &Inst>, inst: &Inst) -> Option<Vec<u32>> {
+    let Fields::Ds { addr, offset0, offset1, gds: false, .. } = &inst.fields else {
+        return None;
+    };
+    let base = match addr {
+        Some(Operand::Vector { reg, .. }) => lds_constant(defs, inst.read(Reg::V(*reg))?)?,
+        _ => return None,
+    };
+    let name = inst.name();
+    let width = match name.rsplit('_').next() {
+        Some("b64" | "u64" | "i64" | "f64") => 2,
+        Some("b96") => 3,
+        Some("b128") => 4,
+        _ => 1,
+    };
+    let at: Vec<u32> = if name.contains("read2") || name.contains("write2") || name.contains("wrxchg2") {
+        let scale = 4 * width * if name.contains("st64") { 64 } else { 1 };
+        vec![base + u32::from(*offset0) * scale, base + u32::from(*offset1) * scale]
+    } else {
+        vec![base + (u32::from(*offset0) | u32::from(*offset1) << 8)]
+    };
+    Some(at.into_iter().flat_map(|a| (a / 4)..(a + 4 * width).div_ceil(4)).collect())
+}
+
+/// Whether two accesses of one region (a read and a write, or writes of different kinds) may
+/// touch the same dword.
+fn lds_conflict(uses: &[(LdsUse, Option<Vec<u32>>)]) -> bool {
+    for (i, (a, da)) in uses.iter().enumerate() {
+        for (b, db) in &uses[i + 1..] {
+            let ordered = match (a, b) {
+                (LdsUse::Read, LdsUse::Read) => false,
+                (LdsUse::Atomic(x), LdsUse::Atomic(y)) => x != y,
+                _ => true,
+            };
+            if !ordered {
+                continue;
+            }
+            match (da, db) {
+                (Some(x), Some(y)) if !x.iter().any(|d| y.contains(d)) => {}
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -862,9 +962,11 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    // per region: LDS reads, LDS writes
+    // per region: LDS reads, LDS writes, and each access with the dwords it touches
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let mut uses: Vec<Vec<(LdsUse, Option<Vec<u32>>)>> = vec![Vec::new(); n];
+    let defs = lds_value_defs(p);
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
@@ -880,9 +982,14 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             } else {
                 writes[r] = true;
             }
+            uses[r].push((lds_use(name), lds_dwords(&defs, i)));
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    // `VICTORY_LDS_EXACT=1`: a read and a write in one region are refused only where they may
+    // touch the same dword (an address not known is taken to touch every dword), and atomics of
+    // one order-free kind (add, min...) on the same dword do not need each other's order.
+    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    if (0..n).any(|r| reads[r] && writes[r] && (!exact || lds_conflict(&uses[r]))) {
         return None;
     }
     let mut meet = vec![(false, false); n];
