@@ -2909,13 +2909,13 @@ mod relay_bucket_tests {
 
     #[test]
     fn clipped_and_aliasing_copies_land_in_page_order() {
-        let base = 0x1234;
-        let wide = relay_merge_bucket(base, PAGE - base, PAGE);
+        let base = 0x1234usize;
+        let wide = relay_merge_bucket(base as u64, PAGE - base, PAGE);
         // Overlaps the end of the wide piece; its offset crosses PAGE
         // relative to this unaligned buffer, but stays in the same title page.
-        assert_eq!(wide, relay_merge_bucket(base, PAGE, 256));
-        assert_eq!(wide, relay_merge_bucket(PAGE + 128, 7, 64));
-        assert_ne!(wide, relay_merge_bucket(base, 2 * PAGE - base, 1));
+        assert_eq!(wide, relay_merge_bucket(base as u64, PAGE, 256));
+        assert_eq!(wide, relay_merge_bucket((PAGE + 128) as u64, 7, 64));
+        assert_ne!(wide, relay_merge_bucket(base as u64, 2 * PAGE - base, 1));
     }
 }
 
