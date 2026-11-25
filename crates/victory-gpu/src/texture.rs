@@ -845,18 +845,42 @@ pub(crate) fn unstage(resource: This) {
     }
 }
 
-/// Where a staged title texture's memory is: address and bytes.
-pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+/// Where a staged title texture's memory is: address and bytes, and the
+/// ranges of it (offsets from the address, bytes) that [`fingerprint`]
+/// reads besides its three windows: the start of every mip of every slice
+/// ([`victory_formats::texture::Layout::sample_ranges`]). None with
+/// `VICTORY_HEAP_RECHECK_MIPS=0`: the three windows alone, as before.
+pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64, Option<std::sync::Arc<[(u64, u64)]>>)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
-    Some((at as u64, len as u64))
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let (at, len) = staging.memory();
+    let mips = recheck_mips().then(|| staging.layout.sample_ranges(MIP_WINDOW, MIP_RANGES).into());
+    Some((at as u64, len as u64, mips))
+}
+
+/// Bytes [`fingerprint`] reads at the start of each mip, and the most mips
+/// it reads of one texture (spread over its slices and mips when it has
+/// more). A 4096-square texture with all its mips: 10 reads, 12 KiB; a cube
+/// map with 10 mips: 40 reads, 52 KiB.
+const MIP_WINDOW: u64 = 1 << 10;
+const MIP_RANGES: usize = 64;
+
+/// Whether [`fingerprint`] also reads the start of every mip of every
+/// slice (`VICTORY_HEAP_RECHECK_MIPS=0`: no).
+fn recheck_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_MIPS").is_none_or(|v| v != "0"))
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
-pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end,
+/// and of the ranges `mips` (offsets from `at`, bytes; see
+/// [`staged_memory`]). A texture streams in whole mips, and the three
+/// windows alone see only the smallest mips and mip 0 of a plain texture,
+/// and only two slices of an array or cube map: a mip or slice that
+/// arrived after the upload elsewhere was not seen. Read through the
+/// kernel, so pages not there count as zeros.
+pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -865,7 +889,8 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let mut hasher = blake3::Hasher::new();
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
+        let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
+        read.resize((3 * WINDOW).max(longest), 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
@@ -877,6 +902,12 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
             take(len - WINDOW, WINDOW);
+            for &(from, bytes) in mips {
+                let from = from as usize;
+                if from < len {
+                    take(from, (bytes as usize).min(len - from));
+                }
+            }
         }
     });
     let hash = hasher.finalize();
