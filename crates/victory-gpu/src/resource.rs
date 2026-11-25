@@ -1519,7 +1519,8 @@ pub(crate) fn host_made<'a>(
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to `FLOOR` bytes of them (a third of the card's budget where that is less),
+/// beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
 /// instead). Past the budget the system moves the card's memory into the
@@ -1538,7 +1539,17 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    // The floor is a third of the card's budget at most: on a card whose whole budget is
+    // about 3 GB the 2 GiB alone, beside the render targets and the buffer copies, put it a
+    // gigabyte over the budget from the first world frame.
+    static FLOOR_HERE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = *FLOOR_HERE.get_or_init(|| {
+        match crate::host::host().and_then(|h| h.video_memory()) {
+            Some([budget, ..]) => FLOOR.min(budget / 3),
+            None => FLOOR,
+        }
+    });
+    if filled < floor {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
