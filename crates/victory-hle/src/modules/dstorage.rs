@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File::new(file));
     put(out, file)
 }
 
@@ -258,6 +258,56 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// More handles on the same file, each its own file object, lent to reads
+    /// that run at the same time ([`File::lend`]).
+    spare: std::sync::Mutex<Vec<std::fs::File>>,
+}
+
+impl File {
+    fn new(file: std::fs::File) -> File {
+        File { file, spare: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// A handle for one read: a spare one, or a new one on the same file
+    /// (`ReOpenFile`); `None` if the host gives none (the read then takes
+    /// the file's own handle, as before). Reads through one synchronous
+    /// handle wait for each other, whatever offsets they read: the I/O
+    /// manager holds the file object's lock for each. With one handle per
+    /// pack file the workers read one at a time: in run vg27's loads 9-11
+    /// workers were busy, nearly all of them reading, at 77-136 MB/s from an
+    /// NVMe drive, with up to 1,204 requests queued (BCPack and zlib took
+    /// a twentieth of a worker).
+    fn lend(&self) -> Option<std::fs::File> {
+        if let Some(file) = self.spare.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Some(file);
+        }
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        // SAFETY: a handle this object owns, open for reading; the new
+        // handle, if any, is ours alone.
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReOpenFile(
+                self.file.as_raw_handle(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                0,
+            )
+        };
+        if handle.is_null() || handle as isize == -1 {
+            return None;
+        }
+        // SAFETY: a handle we just opened and nobody else owns.
+        Some(unsafe { std::fs::File::from_raw_handle(handle) })
+    }
+
+    /// Takes back a handle [`File::lend`] gave (at most 32 are kept).
+    fn give_back(&self, file: std::fs::File) {
+        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < 32 {
+            spare.push(file);
+        }
+    }
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -955,9 +1005,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    // Its own handle for this read, so reads of one file run side by side.
+    let lent = state.lend();
+    let file = lent.as_ref().unwrap_or(&state.file);
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -971,6 +1022,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if let Some(file) = lent {
+        state.give_back(file);
+    }
     result
 }
 
