@@ -2191,8 +2191,10 @@ impl<'a> Lower<'a> {
         } else {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
-        if !every && halves {
-            need(self.cur_ir);
+        if !every {
+            if halves {
+                need(self.cur_ir);
+            }
             return Err(WHERE);
         }
         let c = self.cur;
@@ -2211,45 +2213,11 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        // Not every lane runs and the console wave is this host wave: a lane
-        // whose partner is outside the mask has no partial to read, and the
-        // console's own identity is what its `v_cndmask` put in that lane, so
-        // the ballot's bit stands the identity in for the read. The sum is
-        // then over the lanes that run, in the console's own order.
-        let ballot = if every {
-            None
-        } else {
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let t = self.s.m.bool(true);
-            let b = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
-            self.s.flags |= flags::WAVE_OPS;
-            Some((
-                self.s.m.extract(c, b, 0),
-                self.s.m.extract(c, b, 1),
-                self.s.m.i32(31),
-                self.s.m.i32(32),
-                self.s.m.i32(1),
-                self.s.m.i32(0),
-            ))
-        };
         let mut sum = x;
         for step in 0..steps {
             let bit = self.s.m.i32(1 << step);
             let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
             let theirs = self.read_lane(sum, partner);
-            let theirs = match ballot {
-                None => theirs,
-                Some((blo, bhi, k31, k32, one, zero)) => {
-                    // the partner's bit of the ballot, in the half that holds it
-                    let above = self.s.m.cmp(c, pred::IUGE, partner, k32);
-                    let at = self.s.m.bin(c, Bin::And, partner, k31);
-                    let word = self.s.m.select(c, above, bhi, blo);
-                    let word = self.s.m.bin(c, Bin::LShr, word, at);
-                    let word = self.s.m.bin(c, Bin::And, word, one);
-                    let live = self.s.m.cmp(c, pred::NE, word, zero);
-                    self.s.m.select(c, live, theirs, zero)
-                }
-            };
             sum = self.add_halves(sum, theirs);
         }
         let (high, low, zero) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(0));
@@ -4561,53 +4529,6 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
-    }
-
-    /// Lane `lane` of the console's wave, read from a host wave (or two):
-    /// the console lane number, not the host's.
-    fn read_console_lane(&mut self, a: V, lane: V) -> Result<V, Why> {
-        // A computed lane in a pixel or vertex program is a host lane
-        // (from a mask or `v_mbcnt`); a constant one is the console's.
-        if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
-            self.s.flags |= flags::WAVE_OPS;
-        } else {
-            self.cross_lane(false)?;
-        }
-        if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
-            if self.local && self.local_any {
-                // this host wave's lane of that number (lanes 32..63 are 0..31 here)
-                let k31 = self.s.m.i32(31);
-                let here = self.s.m.bin(self.cur, Bin::And, lane, k31);
-                return Ok(self.read_lane(a, here));
-            }
-            if self.local {
-                return Err("a lane read in a half-wave");
-            }
-            if self.exchange.as_ref().is_some_and(|e| e.1) {
-                // a group of 32 or fewer: the lane is in this host wave
-                return Ok(self.read_lane(a, lane));
-            }
-            // the lane that holds it may be in the other host wave: it gives it through LDS
-            if !self.all_lanes(self.cur_ir) {
-                need(self.cur_ir);
-                return Err("a lane read where not every lane runs");
-            }
-            let cl = self.console_lane();
-            let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-            let k = self.exchange_pair(slot);
-            let at = self.begin_guarded(Some(is));
-            let lds = self.s.lds();
-            let ptr = self.s.m.element(self.cur, lds, k);
-            self.s.m.store(self.cur, ptr, a);
-            self.end_guarded(at, &[]);
-            let c2 = self.cur;
-            self.group_sync(c2);
-            let ptr = self.s.m.element(c2, lds, k);
-            let r = self.s.m.load(c2, ptr);
-            self.group_sync(c2);
-            return Ok(r);
-        }
-        Ok(self.read_lane(a, lane))
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -7669,57 +7590,50 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                let r = self.read_console_lane(a, lane)?;
-                int(self, r)
-            }
-            // `v_permlanex16_b32`: lane i of a row of 16 reads the other row of
-            // its half, at the lane nibble i of {src2, src1} picks — the
-            // `0x0201_0101` the wave reducer uses. Inside a whole-wave section
-            // the simulator models it (`wave.rs`); anywhere else it is a lane
-            // read at a computed console lane, which the console leaves
-            // undefined where the source lane is inactive and so do we.
-            "v_permlanex16_b32" | "v_permlane16_b32" => {
-                let a = s(self, 0)?;
-                let imm = |k: usize| match v.src.get(k) {
-                    Some(&Operand::Const(c)) => crate::resource::inline(c),
-                    Some(&Operand::Literal(x)) => Some(x),
-                    _ => None,
-                };
-                let (Some(s1), Some(s2)) = (imm(1), imm(2)) else {
-                    return Err("a permlane whose selection is computed");
-                };
-                let sel = u64::from(s1) | u64::from(s2) << 32;
-                let c = self.cur;
-                let i32t = self.s.t.i32;
-                let lane = self.console_lane();
-                // the nibble of the selection, at 4 * (lane & 15)
-                let (k15, k4, k16, k_row) = (
-                    self.s.m.i32(15),
-                    self.s.m.i32(4),
-                    self.s.m.i32(16),
-                    self.s.m.i32(!31u32),
-                );
-                let nib = self.s.m.bin(c, Bin::And, lane, k15);
-                let sh = self.s.m.bin(c, Bin::Mul, nib, k4);
-                let i64t = self.s.m.int(64);
-                let selv = self.s.m.int_const(i64t, sel as i64);
-                let sh = self.s.m.cast(c, Cast::ZExt, sh, i64t);
-                let shr = self.s.m.bin(c, Bin::LShr, selv, sh);
-                let shr = self.s.m.cast(c, Cast::Trunc, shr, i32t);
-                let pick = self.s.m.bin(c, Bin::And, shr, k15);
-                // the other row of this lane's half
-                let other = if name == "v_permlanex16_b32" {
-                    let half = self.s.m.bin(c, Bin::And, lane, k16);
-                    let flip = self.s.m.bin(c, Bin::Xor, half, k16);
-                    let row = self.s.m.bin(c, Bin::And, lane, k_row);
-                    self.s.m.bin(c, Bin::Or, row, flip)
+                // A computed lane in a pixel or vertex program is a host lane
+                // (from a mask or `v_mbcnt`); a constant one is the console's.
+                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                    self.s.flags |= flags::WAVE_OPS;
                 } else {
-                    // `v_permlane16`: the selection's nibble picks among this row's own 16
-                    self.s.m.bin(c, Bin::And, lane, k_row)
-                };
-                let index = self.s.m.bin(c, Bin::Or, other, pick);
-                let r = self.read_console_lane(a, index)?;
-                self.s.flags |= flags::INT64;
+                    self.cross_lane(false)?;
+                }
+                if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
+                    if self.local && self.local_any {
+                        // this host wave's lane of that number (lanes 32..63 are 0..31 here)
+                        let k31 = self.s.m.i32(31);
+                        let here = self.s.m.bin(self.cur, Bin::And, lane, k31);
+                        let r = self.read_lane(a, here);
+                        return int(self, r);
+                    }
+                    if self.local {
+                        return Err("a lane read in a half-wave");
+                    }
+                    if self.exchange.as_ref().is_some_and(|e| e.1) {
+                        // a group of 32 or fewer: the lane is in this host wave
+                        let r = self.read_lane(a, lane);
+                        return int(self, r);
+                    }
+                    // the lane that holds it may be in the other host wave: it gives it through LDS
+                    if !self.all_lanes(self.cur_ir) {
+                        need(self.cur_ir);
+                        return Err("a lane read where not every lane runs");
+                    }
+                    let cl = self.console_lane();
+                    let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
+                    let k = self.exchange_pair(slot);
+                    let at = self.begin_guarded(Some(is));
+                    let lds = self.s.lds();
+                    let ptr = self.s.m.element(self.cur, lds, k);
+                    self.s.m.store(self.cur, ptr, a);
+                    self.end_guarded(at, &[]);
+                    let c2 = self.cur;
+                    self.group_sync(c2);
+                    let ptr = self.s.m.element(c2, lds, k);
+                    let r = self.s.m.load(c2, ptr);
+                    self.group_sync(c2);
+                    return int(self, r);
+                }
+                let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
