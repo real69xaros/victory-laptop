@@ -1517,6 +1517,7 @@ mod merge_tests {
 
     #[test]
     fn take_snapshots_flushes_queued_snaps_before_release() {
+        use super::{SNAPS, give_back, pooled, take_snapshots};
         let src = vec![0x5Au8; 64 << 10];
         let mut dst = pooled(32 << 10);
         // SAFETY: `pooled` returns a Vec of at least 32 KiB capacity.
