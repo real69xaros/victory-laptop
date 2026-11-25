@@ -110,7 +110,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     if COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-        tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, at = format_args!("{at:#x}"), "a texture shaders wrote is copied back into title memory, the first (VICTORY_TEXTURE_BACK)");
+        tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, swizzle = layout.desc.swizzle.0, at = format_args!("{at:#x}"), "a texture shaders wrote is copied back into title memory, the first (VICTORY_TEXTURE_BACK)");
     }
     Some(Back { buffer, footprints, rows, mips, layout, at, size })
 }
@@ -140,7 +140,7 @@ pub(crate) fn land(back: &Back) {
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            ONCE.call_once(|| tracing::warn!(?e, mip, slice, swizzle = back.layout.desc.swizzle.0, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
