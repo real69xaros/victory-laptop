@@ -545,3 +545,6 @@ mod tests {
         assert!(STRETCH.contains("if (id.x >= width || id.y >= height) return;"));
     }
 }
+
+#[cfg(test)]
+mod readback;
