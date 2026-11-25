@@ -373,6 +373,77 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // With enhanced barriers (`narrow_waits`): the clamp waits for earlier
+    // compute and copy writes only, not for every draw's pixel work, and
+    // the draw waits for the clamp only.
+    if waits && narrow_waits() {
+        use windows::core::Interface;
+        if let Ok(l7) = l.cast::<ID3D12GraphicsCommandList7>() {
+            // Earlier compute and copy writes (the title's argument passes),
+            // before the clamp reads them.
+            let before = [D3D12_GLOBAL_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_COPY,
+                SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+                AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            }];
+            // The scratch buffer: the last indirect call read it, the clamp
+            // writes it.
+            let reuse = [D3D12_BUFFER_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                AccessBefore: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+                AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                pResource: std::mem::ManuallyDrop::new(Some(dst.clone())),
+                Offset: 0,
+                Size: u64::MAX,
+            }];
+            let after = [D3D12_BUFFER_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+                pResource: std::mem::ManuallyDrop::new(Some(dst.clone())),
+                Offset: 0,
+                Size: u64::MAX,
+            }];
+            // SAFETY: an open list; our root signature and pipeline; live
+            // buffers. The scratch buffer is only ever barred this way.
+            unsafe {
+                l7.Barrier(&[
+                    D3D12_BARRIER_GROUP {
+                        Type: D3D12_BARRIER_TYPE_GLOBAL,
+                        NumBarriers: 1,
+                        Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: before.as_ptr() },
+                    },
+                    D3D12_BARRIER_GROUP {
+                        Type: D3D12_BARRIER_TYPE_BUFFER,
+                        NumBarriers: 1,
+                        Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: reuse.as_ptr() },
+                    },
+                ]);
+                if records > 0 {
+                    l.SetComputeRootSignature(&c.root);
+                    l.SetPipelineState(&c.pso);
+                    l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    l.SetComputeRootShaderResourceView(1, src_gpu);
+                    l.SetComputeRootShaderResourceView(2, count_gpu);
+                    l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+                    l.SetComputeRootUnorderedAccessView(4, budget);
+                    l.Dispatch(records.div_ceil(64), 1, 1);
+                }
+                l7.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_BUFFER,
+                    NumBarriers: 1,
+                    Anonymous: D3D12_BARRIER_GROUP_0 { pBufferBarriers: after.as_ptr() },
+                }]);
+            }
+            for barrier in after.into_iter().chain(reuse) {
+                drop(std::mem::ManuallyDrop::into_inner(barrier.pResource));
+            }
+            return true;
+        }
+    }
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -397,7 +468,46 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
     done_on(&list.list, scratch);
 }
 
+/// Whether the clamp's two waits are enhanced barriers that wait for what
+/// they must and nothing else (`VICTORY_NARROW_WAITS=1`), where the host
+/// has them.
+///
+/// Each indirect call clamps its record in a pass of its own between two
+/// legacy waits; the first, a UAV barrier on every resource, waits for all
+/// earlier work, the pixel shading of the draws before it included. The
+/// title's world frame makes ~6,400 such calls, ~20 us each on the card in
+/// the timing runs of 2026-11-25. The earlier writes the clamp reads are
+/// compute passes and copies (the title's argument passes; a write by
+/// another stage is behind the title's own barrier, which stays).
+fn narrow_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_NARROW_WAITS").is_none_or(|v| v != "1") {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a plain query into a struct of the size given.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                std::ptr::from_mut(&mut options).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+            )
+        }
+        .is_ok();
+        let on = ok && options.EnhancedBarriersSupported.as_bool();
+        tracing::info!(on, "argument clamp: enhanced barriers (VICTORY_NARROW_WAITS)");
+        on
+    })
+}
+
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
+    // Barred with enhanced barriers only (`narrow_waits`): no state to
+    // give back.
+    if narrow_waits() {
+        return;
+    }
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
         list.ResourceBarrier(&[transition(
