@@ -2106,6 +2106,39 @@ impl Shadow {
         self.copy_back_with(address, len, None)
     }
 
+    /// Faults the title's pages of `[address, address + len)` in before they
+    /// are compared: 49 745 faults a frame was 145 ms of a 263 ms frame, and
+    /// the kernel faults a range in one call far cheaper than one page at a
+    /// time. `VICTORY_PREFETCH=0` turns it off.
+    #[cfg(windows)]
+    fn prefetch(address: usize, len: usize) {
+        #[repr(C)]
+        struct Entry {
+            address: *mut core::ffi::c_void,
+            bytes: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn PrefetchVirtualMemory(
+                process: *mut core::ffi::c_void,
+                count: usize,
+                entries: *const Entry,
+                flags: u32,
+            ) -> i32;
+        }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("VICTORY_PREFETCH").map(|v| v != "0").unwrap_or(true));
+        if !on || len == 0 {
+            return;
+        }
+        let entry = Entry {
+            address: address as *mut core::ffi::c_void,
+            bytes: len,
+        };
+        // SAFETY: a live mapping of ours; the call only faults pages in.
+        unsafe { PrefetchVirtualMemory(std::ptr::null_mut(), 1, &entry, 0) };
+    }
+
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
@@ -2128,6 +2161,10 @@ impl Shadow {
             // memory speed), title memory read only where the GPU wrote.
             #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
+            #[cfg(windows)]
+            if found.is_none() {
+                Self::prefetch(start + from, to - from);
+            }
             let differing = match found {
                 Some(found) => found,
                 None => self.differing(from, to, before),
