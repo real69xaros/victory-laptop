@@ -162,6 +162,12 @@ impl<'a> Lower<'a> {
                 self.unused_descriptor_kind(inst, site, code, count)
             {
                 (0, used, uav, props, image, true)
+            } else if count >= 4 && address.is_some_and(|a| a.dynamic.is_some()) {
+                // A descriptor picked from a heap at an index the host resolves at bind,
+                // whose dwords only feed a size (Yeetbot159/VIctory#71, 8cc59b2: five
+                // deferred G-buffer pixel programs): the selected view's dimensions answer
+                // as a 2D image's do.
+                (0, None, false, (2, 0x409), Some(2), true)
             } else if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
