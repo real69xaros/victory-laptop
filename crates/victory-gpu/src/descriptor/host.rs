@@ -237,12 +237,42 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        // More ranges than a pass takes at once. They were all dropped here
+        // (meant for when no pass runs: no shader that picks textures by
+        // index is bound), but in gameplay a load notes tens of thousands
+        // between two passes (at 2-3 frames a second a pass comes every
+        // 300-400 ms), and every texture written before the drop stayed as
+        // its first look found it: 98,304 ranges dropped in run vg28,
+        // 229,376 in vg30. Now they are joined instead, the gaps allowed
+        // between them growing until half are left: a few textures near the
+        // ranges are looked at once more than needed, none is left out.
+        let before = ranges.len();
+        coalesce(&mut ranges, MOST / 2);
+        STALE[2].fetch_add((before - ranges.len()) as u64, Relaxed);
     }
     ranges.push((start, end));
+}
+
+/// Sorts `ranges` and joins them until at most `most` are left: those that
+/// touch or overlap, then those less than 64 KiB apart, then 256 KiB, and
+/// so on.
+fn coalesce(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    ranges.sort_unstable();
+    let mut gap = 0u64;
+    loop {
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(start, end) in ranges.iter() {
+            match joined.last_mut() {
+                Some(last) if start <= last.1.saturating_add(gap) => last.1 = last.1.max(end),
+                _ => joined.push((start, end)),
+            }
+        }
+        *ranges = joined;
+        if ranges.len() <= most || gap >= 1 << 40 {
+            return;
+        }
+        gap = if gap == 0 { 64 << 10 } else { gap * 4 };
+    }
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -2411,6 +2441,22 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ranges past the limit are joined, never dropped: touching ones first,
+    /// then across growing gaps, and every range stays covered.
+    #[test]
+    fn noted_ranges_are_joined_not_dropped() {
+        let mut ranges = vec![(300, 400), (0, 100), (100, 200), (1 << 20, (1 << 20) + 10)];
+        coalesce(&mut ranges, 3);
+        assert_eq!(ranges, vec![(0, 200), (300, 400), (1 << 20, (1 << 20) + 10)]);
+        let original: Vec<(u64, u64)> = (0..1000u64).map(|i| (i * 100_000, i * 100_000 + 4096)).collect();
+        let mut ranges = original.clone();
+        coalesce(&mut ranges, 100);
+        assert!(ranges.len() <= 100);
+        for &(start, end) in &original {
+            assert!(ranges.iter().any(|&(s, e)| s <= start && end <= e), "{start}..{end} left out");
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
