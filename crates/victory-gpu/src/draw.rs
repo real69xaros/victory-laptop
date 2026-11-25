@@ -1521,6 +1521,24 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        // The walk below is over every placed slot of the heap - 663 884 of
+        // them in the world - and it cost 54.5 ms a frame. It can only find
+        // what the last walk found when the title has written no slot since
+        // (the counter of placements is the same) and nothing waits for more
+        // of its pages to be mapped. Then there is nothing to do at all.
+        // `VICTORY_HEAP_TEXTURE_SKIP=0` walks every frame as before.
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static HEAP_TEXTURE_SKIPS: AtomicU64 = AtomicU64::new(0);
+        if *SKIP.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURE_SKIP").is_none_or(|v| v != "0")) {
+            static LAST_PLACED: AtomicU64 = AtomicU64::new(u64::MAX);
+            let placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed);
+            if LAST_PLACED.swap(placed, Ordering::Relaxed) == placed
+                && HEAP_TEXTURES_WAITING.load(Ordering::Relaxed) == 0
+            {
+                HEAP_TEXTURE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
