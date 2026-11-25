@@ -116,7 +116,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard and mouse as a pad (rebindable) | Trigger rumble; keyboard prompts |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
@@ -166,17 +166,29 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads, and keyboard and mouse played like a PC game. The title
+reads pads only, so the keyboard and mouse act on the first connected pad (or
+a stand-in pad when none is): both work at once, each stick follows whichever
+moved it last. The mouse turns the camera through the right stick, its motion
+turned into a rate at each read of the title so the same movement turns the
+same angle at any frame rate. While the window has focus the cursor is hidden
+and held in it; Alt-Tab or Esc frees it, a click or Esc captures it again.
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| Keys (on foot) | Pad | Keys (in a vehicle) | Pad |
+|------|-----|------|-----|
+| W A S D, Left Alt | left stick, walk | W / S, A D | RT / LT, steer |
+| mouse, left / right button | right stick, RT / LT | Space, E | RB, LS |
+| Left Shift, Space, F, R | A, X, Y, B | F, G | Y + vehicle layout off, layout only |
+| Q, E, Left Ctrl, C | RB, D-pad right, LS, RS | | |
+| Tab, V or M, wheel | LB, View, D-pad left / right | | |
+| arrows, Enter, Backspace, Esc or P | D-pad, A, B, Menu | | |
+
+The letters are the keys at those places on a US keyboard, so the left stick
+is Z Q S D on an AZERTY keyboard (`keys_by_position = false`: by letter).
+F (enter a vehicle) also switches to the vehicle layout and back; G switches
+it alone when it is out of step. Rebind everything in `[controls]` of
+`victory.toml` (see `victory.example.toml`); `enabled = false` brings back the
+old fixed stand-in pad (W A S D / I J K L sticks, Enter, Backspace, X, Y).
 
 ## Commands
 
