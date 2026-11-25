@@ -83,6 +83,7 @@ fn build() -> &'static [u8; 32] {
         key.update(&victory_shader::emit::shader_opt().to_le_bytes());
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_RT_MISS",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_F16_NEAREST",

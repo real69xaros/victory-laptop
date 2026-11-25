@@ -126,6 +126,17 @@ pub use shader::{
     set_view_heap_limit, view_heap_limit,
 };
 
+/// `VICTORY_RT_MISS=1`: every ray-tracing node test returns a miss. With
+/// the console's structure builder off nothing builds the structures the
+/// title's rays walk, and what they read there (zeros, stale memory) made
+/// its ray-traced shadow and light come out black; with every ray missing,
+/// nothing blocks light (no ray-traced shadows, but lit surfaces).
+/// (From the VIctory-GTA6-build-v6 patch.)
+pub fn rays_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 

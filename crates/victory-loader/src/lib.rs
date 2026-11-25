@@ -56,6 +56,31 @@ pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
 };
 
+/// Replaces the bytes at `at` with `new` if they are `expected` now (a
+/// patch of a loaded image's code in memory; the file is not touched).
+/// Returns whether it was written.
+#[cfg(windows)]
+pub fn patch_code(at: usize, expected: &[u8], new: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    if expected.len() != new.len() || new.is_empty() {
+        return false;
+    }
+    // SAFETY: the caller names bytes inside a mapped image; they are read
+    // and, when they match, made writable, written and protected again.
+    unsafe {
+        if std::slice::from_raw_parts(at as *const u8, expected.len()) != expected {
+            return false;
+        }
+        let mut old = 0u32;
+        if VirtualProtect(at as *const _, new.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, new.len());
+        VirtualProtect(at as *const _, new.len(), old, &mut old);
+    }
+    true
+}
+
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.

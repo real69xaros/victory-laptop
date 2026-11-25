@@ -40,6 +40,10 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    // From the VIctory-GTA6-build-v6 patch (on jmehru/victory-amd-rx9070 aae8d6c).
+    hold(image.base(), image.info().size_of_image as usize);
+    patch(image.base(), image.info().size_of_image as usize);
+    peek(image.base(), image.info().size_of_image as usize);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -208,6 +212,121 @@ fn watch(base: usize, size: usize) {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// `VICTORY_PATCH=<rva>:<expected hex>:<new hex>,...`: bytes of the title's
+/// code replaced in memory before it runs, each only if the code there is
+/// the expected bytes (another build of the title is left alone). The game
+/// files are not touched. Grand Theft Auto VI's pool of 224-byte objects
+/// (title+0xA9EC938) holds the 22,500 entries its configuration gives; at
+/// our frame rates it fills during cutscenes and the title stops at
+/// title+0x5149aec (`int 3` on an empty free list).
+/// `5AD8E60:E8DB605FFF:B800000100` replaces the configuration call that
+/// sizes it with `mov eax, 0x10000` (65,536 entries; its indices hold up to
+/// 131,070). With it, the pool of 192-byte objects (title+0x8FE1078) ran
+/// empty next (title+0x1fa88e4): `5ABB240:E8FB3C61FF:B800000100` likewise.
+/// (Doubling all 596 of the title's pools at the function that makes them
+/// stopped it at start, title+0x22106e0: some must keep their size.)
+#[cfg(windows)]
+fn patch(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_PATCH") else {
+        return;
+    };
+    let bytes = |h: &str| -> Option<Vec<u8>> {
+        let h = h.trim();
+        (h.len() % 2 == 0)
+            .then(|| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect())
+            .flatten()
+    };
+    for item in list.split(',') {
+        let mut parts = item.split(':');
+        let (Some(rva), Some(old), Some(new)) = (parts.next(), parts.next(), parts.next()) else {
+            eprintln!("VIctory: patch {item:?} not understood");
+            continue;
+        };
+        let (Ok(rva), Some(old), Some(new)) =
+            (usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16), bytes(old), bytes(new))
+        else {
+            eprintln!("VIctory: patch {item:?} not understood");
+            continue;
+        };
+        if rva + new.len() > size {
+            eprintln!("VIctory: patch at title+{rva:#x} outside the image");
+            continue;
+        }
+        let done = victory_loader::patch_code(base + rva, &old, &new);
+        eprintln!(
+            "VIctory: patch at title+{rva:#x}: {}",
+            if done { "applied" } else { "not applied (the code there differs)" }
+        );
+    }
+}
+
+/// Debugging aid: `VICTORY_PEEK=<rva>,...` (hex): every 10 s, the eight
+/// dwords at the address the title pointer at each title+rva holds (for a
+/// structure reached through a global, such as one of the title's pools).
+#[cfg(windows)]
+fn peek(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_PEEK") else {
+        return;
+    };
+    let rvas: Vec<usize> = list
+        .split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva + 8 <= size)
+        .collect();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            for &rva in &rvas {
+                // SAFETY: eight bytes inside the mapped image, checked above.
+                let ptr = unsafe { ((base + rva) as *const u64).read_volatile() } as usize;
+                let mut words = [0u32; 8];
+                if ptr != 0 {
+                    // SAFETY: a structure the title made at start and keeps
+                    // (a pool header), 32 bytes of it.
+                    words = unsafe { (ptr as *const [u32; 8]).read_volatile() };
+                }
+                eprintln!(
+                    "VIctory: peek {:>5}s title+{rva:#x} -> {ptr:#x}: {:x?}",
+                    started.elapsed().as_secs(),
+                    words
+                );
+            }
+        }
+    });
+}
+
+/// `VICTORY_HOLD=<rva>:<byte>,...` (hex) keeps the byte at each title+rva at
+/// that value, rewritten every 100 ms: a title switch held on or off. Grand
+/// Theft Auto VI's hang watchdog (`71B6330:1` pauses it) otherwise ends the
+/// game when a frame takes seconds (a null write at title+0x23cf683).
+#[cfg(windows)]
+fn hold(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_HOLD") else {
+        return;
+    };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let held: Vec<(usize, u8)> = list
+        .split(',')
+        .filter_map(|r| r.split_once(':'))
+        .filter_map(|(rva, v)| Some((hex(rva)?, u8::try_from(hex(v)?).ok()?)))
+        .filter(|&(rva, _)| rva < size)
+        .collect();
+    for &(rva, value) in &held {
+        eprintln!("VIctory: holding title+{rva:#x} at {value:#x}");
+    }
+    std::thread::spawn(move || {
+        loop {
+            for &(rva, value) in &held {
+                // SAFETY: one byte inside the mapped image, checked above;
+                // the title reads it as a plain flag.
+                unsafe { ((base + rva) as *mut u8).write_volatile(value) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
 }
