@@ -2876,6 +2876,49 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
+/// The compare and the CPU scan both cut pieces at 64 KiB boundaries of
+/// title memory. Two declarations can clip the same page differently, or
+/// reach it through buffers with different bases. Keep their landing order.
+fn relay_merge_bucket(start: u64, offset: usize, bytes: usize) -> usize {
+    let address = start as usize + offset;
+    let page = address / crate::watch::PAGE;
+    debug_assert!(bytes > 0 && (address + (bytes - 1)) / crate::watch::PAGE == page);
+    page % MERGE_BUCKETS
+}
+
+const MERGE_BUCKETS: usize = 8;
+
+/// The CPU relay takes whole spans per worker. Aliased spans in one
+/// landing keep their original order on the landing thread.
+fn separate_ranges(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
+    let mut ranges: Vec<_> = ranges.filter(|(lo, hi)| lo < hi).collect();
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+}
+
+#[cfg(test)]
+mod relay_bucket_tests {
+    use super::{relay_merge_bucket, separate_ranges};
+    use crate::watch::PAGE;
+
+    #[test]
+    fn adjacent_cpu_spans_can_land_together() {
+        assert!(separate_ranges([(9, 12), (2, 9), (7, 7)].into_iter()));
+        assert!(!separate_ranges([(2, 10), (4, 7)].into_iter()));
+    }
+
+    #[test]
+    fn clipped_and_aliasing_copies_land_in_page_order() {
+        let base = 0x1234;
+        let wide = relay_merge_bucket(base, PAGE - base, PAGE);
+        // Overlaps the end of the wide piece; its offset crosses PAGE
+        // relative to this unaligned buffer, but stays in the same title page.
+        assert_eq!(wide, relay_merge_bucket(base, PAGE, 256));
+        assert_eq!(wide, relay_merge_bucket(PAGE + 128, 7, 64));
+        assert_ne!(wide, relay_merge_bucket(base, 2 * PAGE - base, 1));
+    }
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -4690,7 +4733,7 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-    if wide_merge() && work.len() >= 8 {
+    if wide_merge() && work.len() >= 8 && separate_ranges(work.iter().map(|(_, from, to)| (*from, *to))) {
         // The spans of a copy are apart from one another, so several copies
         // at a time; every span of one copy shares a bucket and merges in
         // order.
@@ -6147,16 +6190,11 @@ impl Host {
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
         let written = if wide_merge() && pieces.len() >= 8 {
-            // The pieces are apart from one another (each its own 64 KiB
-            // bytes of its copy and of title memory), so several at a time;
-            // those of one copy in one 64 KiB page share a bucket and merge
-            // in order.
-            const BUCKETS: usize = 8;
-            let mut buckets: [Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>; BUCKETS] =
+            let mut buckets: [Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>; MERGE_BUCKETS] =
                 std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at) in pieces {
-                let key = (std::sync::Arc::as_ptr(&shadow) as usize >> 6) ^ (lo >> 16);
-                buckets[key % BUCKETS].push((shadow, lo, hi, at));
+                let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
+                buckets[key].push((shadow, lo, hi, at));
             }
             let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
@@ -6329,18 +6367,10 @@ impl Host {
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
         let piece_count = pieces.len();
-        // The merges of a carded copy take its read lock; a piece cut at a
-        // 64 KiB page boundary would have two callers in one page's bytes
-        // and is left to the serial path.
-        let single_page = pieces.iter().all(|(_, lo, hi, _, _)| (lo >> 16) == (hi.saturating_sub(1) >> 16));
-        let (written, bytes) = if wide_merge() && piece_count >= 8 && single_page {
-            // The pieces are apart from one another (each its own 64 KiB
-            // bytes of its copy and of title memory), so several at a time.
-            // A (copy, page) always lands in the same bucket, in plan order.
-            const BUCKETS: usize = 8;
-            let mut buckets: [Vec<Piece>; BUCKETS] = std::array::from_fn(|_| Vec::new());
+        let (written, bytes) = if wide_merge() && piece_count >= 8 {
+            let mut buckets: [Vec<Piece>; MERGE_BUCKETS] = std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at, after) in pieces {
-                let key = ((Arc::as_ptr(&shadow) as usize >> 6) ^ (lo >> 16)) % BUCKETS;
+                let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
                 buckets[key].push((shadow, lo, hi, at, after));
             }
             let total_written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
