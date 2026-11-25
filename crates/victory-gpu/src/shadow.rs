@@ -1510,6 +1510,23 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn take_snapshots_flushes_queued_snaps_before_release() {
+        let src = vec![0x5Au8; 64 << 10];
+        let mut dst = pooled(32 << 10);
+        // SAFETY: `pooled` returns a Vec of at least 32 KiB capacity.
+        unsafe { dst.set_len(32 << 10) };
+        SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((
+            src.as_ptr() as usize,
+            dst.as_mut_ptr() as usize,
+            32 << 10,
+        ));
+        take_snapshots();
+        assert!(dst.iter().all(|&b| b == 0x5A));
+        assert!(SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        give_back(dst);
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -1518,6 +1535,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if wide_back() && !SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            take_snapshots();
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
