@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
 $env:VICTORY_DISPLAY_MODE = '1280x720'
-$env:VICTORY_TEXTURE_BUDGET_MB = '2048'   # textures stay loaded; Series S leaves room (8.7 GB peak)
+$env:VICTORY_TEXTURE_BUDGET_MB = '1024'   # faster on this branch than 2048 (2.80 vs 2.49 fps), 7.4 GB peak
 $env:VICTORY_LATE_WAIT = '3'
 $env:VICTORY_TEXTURE_NO_WAIT = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '24'

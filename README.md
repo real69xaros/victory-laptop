@@ -28,7 +28,10 @@ Each line is a 12-minute run from the same save (the prologue's prison yard), th
 | Series S profile (fxceless #188), control run | 2.27 |
 | This branch, `VICTORY_WIDE_REFRESH/MERGE/BACK=1` (copies on several threads) | 2.49 |
 | + `VICTORY_RELAY=1` (copy-back overlaps the next frame's GPU work) | 2.78 |
-| + `VICTORY_TEXTURE_BUDGET_MB=2048` (textures stay loaded) | **2.80** |
+| + `VICTORY_TEXTURE_BUDGET_MB=2048` (textures stay loaded) | 2.80 |
+| This branch (G13: + water copy-back, 10 more shaders, the CPU fixes below), 1 GB textures | **2.80**, 7.4 GB peak |
+| the same with 2 GB textures | 2.49 |
+| the same without the water copy-back (`VICTORY_TEXTURE_BACK=0`) | 2.82 |
 
 Where a frame went on this machine (profiler and per-command GPU timestamps): about 200 ms of GPU
 work, most of it in ~4,000 indirect mesh draws a frame, and about 145 ms of CPU preparing
@@ -53,6 +56,16 @@ Picked from other forks and pull requests (their authors are kept on each commit
   `VICTORY_PATCH`
 - FQY55kai (bind cache), Geckomacabre/vx-layer (`VICTORY_WAVE_WIDE_ONLY`, `VICTORY_TEXTURE_HOT`),
   upstream mesh index mask, and the earlier picks listed in the history
+- PastiiJay/klbf-lab-beta: what shaders write into the textures the title reads on the CPU (the ocean
+  height map) is copied back into title memory, so boats float; the XOR swizzle patterns (from
+  MiamiGame/XTP, generated from Mesa's addrlib)
+- Yeetbot159/VIctory #71: a heap-picked descriptor read only for its size (10 more programs translate)
+- fxceless #1044 (disk workers sized to physical cores), #1066 (relay copy-back merges on several
+  threads), #1068 (heap-buffer refreshes under one lock), 0b0074e (the threads the frame waits for on
+  the fast cores)
+- Dathinel (texture floor at most a third of the card's budget, fxceless issue #1113) and Pavl3000
+  (the heap texture walk skipped when nothing was placed; title pages faulted in before a copy-back),
+  both commits outside any pull request
 
 Ported or fixed here:
 
