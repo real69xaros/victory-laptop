@@ -262,6 +262,11 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange` and `ds_bpermute_b32` in a group over 32 threads: the LDS
+    /// base dword of the 64-dword-per-console-wave scratch, and the cached
+    /// `(wave_off, base)` pair for this thread's console wave in the entry block.
+    bpermute_slot: Option<u32>,
+    bpermute_base: Option<(V, V)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1402,6 +1407,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // 64-dword-per-console-wave LDS scratch for cross-half `ds_bpermute_b32`
+        let mut bpermute_slot: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1491,6 +1498,18 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                if group > 32
+                                    && !LOCAL_WAVES.get()
+                                    && insts().any(|i| i.name() == "ds_bpermute_b32")
+                                {
+                                    let scratch = 64 * group.div_ceil(64);
+                                    // Reserve 1 dword for `halves`'s `wave_base` counter inside
+                                    // D3D12's 32 KiB (8,192 dword) groupshared limit.
+                                    if s.lds_dwords + scratch < 8192 {
+                                        bpermute_slot = Some(s.lds_dwords);
+                                        s.lds_dwords += scratch;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1695,6 +1714,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            bpermute_slot,
+            bpermute_base: None,
             halves,
             wave_base: None,
             flat: None,
@@ -3860,6 +3881,23 @@ impl<'a> Lower<'a> {
         v
     }
 
+    /// `(wave_off, base)` for cross-half `ds_bpermute_b32` (made in the entry
+    /// block): `wave_off` is this console wave's first thread index (`thread & !63`)
+    /// and `base` is its 64-dword scratch start (`slot + wave_off`).
+    fn bpermute_base(&mut self, slot: u32) -> (V, V) {
+        if let Some(pair) = self.bpermute_base {
+            return pair;
+        }
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let mask = self.s.m.i32(!63);
+        let wave_off = self.s.m.bin(e, Bin::And, thread, mask);
+        let start = self.s.m.i32(slot);
+        let base = self.s.m.bin(e, Bin::Add, start, wave_off);
+        self.bpermute_base = Some((wave_off, base));
+        (wave_off, base)
+    }
+
     /// The console's decision of the branch closing IR block `b`, which the wave takes
     /// together ([`Structured::wide`]): `when` is the lane's own bit, and the branch is taken
     /// when some lane's `when` holds (`execnz`, `vccnz`, SCC of a mask operation set) or
@@ -4526,11 +4564,6 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
@@ -4546,7 +4579,62 @@ impl<'a> Lower<'a> {
                 }
                 None => x,
             };
-            let r = self.read_lane(x, src);
+            let r = match self.exchange.as_ref().map(|e| e.1) {
+                Some(true) => {
+                    // Console wave64 in a single 32-lane host wave (`group <= 32`):
+                    // lanes 32..63 do not exist and must read 0 without passing an
+                    // out-of-bounds lane index to `WaveReadLaneAt`.
+                    let k32 = self.s.m.i32(32);
+                    let k31 = self.s.m.i32(31);
+                    let z = self.s.m.i32(0);
+                    let in_half = self.s.m.cmp(c, pred::IULT, src, k32);
+                    let lane = self.s.m.bin(c, Bin::And, src, k31);
+                    let r = self.read_lane(x, lane);
+                    self.s.m.select(c, in_half, r, z)
+                }
+                Some(false) if self.local && self.local_any => {
+                    let k31 = self.s.m.i32(31);
+                    let lane = self.s.m.bin(c, Bin::And, src, k31);
+                    self.read_lane(x, lane)
+                }
+                Some(false) if self.local => {
+                    return Err("a lane permute in a half-wave");
+                }
+                Some(false) => {
+                    // Console wave64 across two 32-lane host waves: exchange all 64
+                    // lanes through a 64-dword-per-console-wave LDS scratch buffer.
+                    if !self.all_lanes(self.cur_ir) {
+                        need(self.cur_ir);
+                        return Err("a lane permute where not every lane runs");
+                    }
+                    let Some(slot) = self.bpermute_slot else {
+                        return Err("a lane permute across two host waves (not enough LDS)");
+                    };
+                    let (wave_off, base) = self.bpermute_base(slot);
+                    let cl = self.console_lane();
+                    let dst_idx = self.s.m.bin(c, Bin::Add, base, cl);
+                    let lds = self.s.lds();
+                    let dst_ptr = self.s.m.element(c, lds, dst_idx);
+                    self.s.m.store(c, dst_ptr, x);
+                    self.group_sync(c);
+                    let src_idx = self.s.m.bin(c, Bin::Add, base, src);
+                    let src_ptr = self.s.m.element(c, lds, src_idx);
+                    let mut r = self.s.m.load(c, src_ptr);
+                    self.group_sync(c);
+                    // Partial final console wave (`group % 64 != 0`): lanes at or past
+                    // `group` never ran and left their scratch dwords uninitialised.
+                    let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+                    if !group.is_multiple_of(64) {
+                        let abs_src = self.s.m.bin(c, Bin::Add, wave_off, src);
+                        let limit = self.s.m.i32(group);
+                        let in_group = self.s.m.cmp(c, pred::IULT, abs_src, limit);
+                        let z = self.s.m.i32(0);
+                        r = self.s.m.select(c, in_group, r, z);
+                    }
+                    r
+                }
+                None => self.read_lane(x, src),
+            };
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

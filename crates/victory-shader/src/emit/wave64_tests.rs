@@ -559,6 +559,123 @@ fn without_skips_keeps_execz_guard_over_vcc_loop() {
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
+
+/// Runs a compute shader on the hardware device and returns `uav_dwords` dwords
+/// from UAV 0, or `None` if no hardware device with wave32 support is present.
+fn on_the_card_uav(
+    shader: &HostShader,
+    constants: [u32; 2],
+    uav_dwords: u32,
+) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(p) => p,
+        Err(e) => panic!("hardware pipeline refused: {e}"),
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = constants[d as usize];
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(uav_dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// Builds a wave64 compute program with `threads` threads in x:
+/// - `v1 = v0 + 1000` (each thread's payload)
+/// - `v2 = (v0 ^ s0) << 2` (source lane byte address)
+/// - `v3 = 0x5555_5555` (sentinel kept by guarded-off destination lanes)
+/// - Under `v0 < s1` (`guard`, or a `s_cbranch_execz` skip when `branch` is set):
+///   `ds_bpermute_b32 v3, v2, v1 offset:offset`
+/// - Every thread stores `v3` to `uav[v0]`.
+fn bpermute_program(threads: u32, offset: u16, branch: bool, lds_bytes: u32) -> NativeProgram {
+    let mut words = vec![
+        0x4A02_00FF,
+        1000, // v_add_nc_u32 v1, 1000, v0
+        0x3A04_0000, // v_xor_b32 v2, s0, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x7E06_02FF,
+        0x5555_5555, // v_mov_b32 v3, 0x5555_5555
+        0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0  (v0 < s1)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    if branch {
+        words.push(0xBF88_0002); // s_cbranch_execz over the 2-dword ds_bpermute_b32
+    }
+    words.extend_from_slice(&[
+        0xDACC_0000 | u32::from(offset),
+        (3u32 << 24) | (1u32 << 8) | 2u32, // ds_bpermute_b32 v3, v2, v1 offset:offset
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0  (byte offset = v0 * 4)
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 4, // buffer_store_dword v3, v4, s[8:11], 0 offen
+    ]);
+    let mut prog = native_of(&words, true, threads);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.rsrc2 |= (lds_bytes / 512) << 15;
+    }
+    prog
+}
+
+fn expected_bpermute(threads: u32, offset: u16, xor_mask: u32, active_below: u32) -> Vec<u32> {
+    (0..threads)
+        .map(|t| {
+            if t >= active_below {
+                return 0x5555_5555;
+            }
+            let wave_off = t & !63;
+            let addr = (t ^ xor_mask).wrapping_shl(2).wrapping_add(u32::from(offset));
+            let src_lane = (addr >> 2) & 63;
+            let src_thread = wave_off + src_lane;
+            if src_thread < threads && src_thread < active_below {
+                src_thread + 1000
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn bpermute_small_wave64_group_returns_zero_for_upper_lanes() {
+    let prog = bpermute_program(32, 0, false, 0);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered(&prog, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (xor_mask, active_below) in [(32u32, 32u32), (1, 32), (1, 16), (32, 16)] {
+        let Some(got) = on_the_card_uav(&shader, [xor_mask, active_below], 32) else {
+            return;
+        };
+        let want = expected_bpermute(32, 0, xor_mask, active_below);
+        assert_eq!(got, want, "small group [32]: xor={xor_mask}, active<{active_below}");
+    }
+}
+
+#[test]
+fn bpermute_cross_half_on_wave32_exchanges_all_64_lanes_and_guards() {
+    for (threads, offset) in [(64u32, 0u16), (64, 4), (128, 0)] {
+        let prog = bpermute_program(threads, offset, false, 0);
+        let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+        let shader = lowered(&prog, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }
@@ -568,4 +685,85 @@ fn without_skips_keeps_execz_guard_over_vcc_loop() {
             assert_eq!(got, expected, "{label}: s0 = {below}, lane {lane}");
         }
     }
+}
+
+        for (xor_mask, active_below) in [(32u32, threads), (63, threads), (32, threads / 2 + 7)] {
+            let Some(got) = on_the_card_uav(&shader, [xor_mask, active_below], threads) else {
+                return;
+            };
+            let want = expected_bpermute(threads, offset, xor_mask, active_below);
+            assert_eq!(
+                got, want,
+                "threads={threads}, offset={offset}, xor={xor_mask}, active<{active_below}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bpermute_partial_tail_wave_returns_zero_for_missing_lanes() {
+    let prog = bpermute_program(96, 0, false, 0);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered(&prog, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (xor_mask, active_below) in [(32u32, 96u32), (63, 96), (32, 80)] {
+        let Some(got) = on_the_card_uav(&shader, [xor_mask, active_below], 96) else {
+            return;
+        };
+        let want = expected_bpermute(96, 0, xor_mask, active_below);
+        assert_eq!(got, want, "partial tail [96]: xor={xor_mask}, active<{active_below}");
+    }
+}
+
+#[test]
+fn bpermute_in_lane_branch_widens_and_lds_overflow_refuses() {
+    // (a) `ds_bpermute_b32` inside a per-lane branch triggers `needs_every_lane`
+    // and succeeds once the branch is widened with `structure_wide`.
+    let prog = bpermute_program(64, 0, true, 0);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the skip");
+    lower::take_needs();
+    let per_lane = lowered(&prog, &p, &HashSet::new());
+    let err = match per_lane {
+        Err(ShaderError::Unsupported { what, .. }) => what,
+        other => panic!("expected unsupported refusal, got {:?}", other.err()),
+    };
+    assert_eq!(err, "a lane permute where not every lane runs");
+    assert!(lower::needs_every_lane(err));
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(
+        lower::branches_around(&st, &lower::take_needs()),
+        Some(vec![branch])
+    );
+
+    let shader = lowered(&prog, &p, &HashSet::from([branch])).expect("widened lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(got) = on_the_card_uav(&shader, [32, 40], 64) {
+        let want = expected_bpermute(64, 0, 32, 40);
+        assert_eq!(got, want, "widened lane-branch bpermute");
+    }
+
+    // (b) Pre-allocated 32 KiB LDS leaves no room for the 64-dword/wave scratch.
+    let big_lds = bpermute_program(128, 0, false, 32768);
+    let p_big = ir::build(&big_lds.code, big_lds.wave64, big_lds.vgprs).expect("ir::build");
+    let overflow = lowered(&big_lds, &p_big, &HashSet::new());
+    assert!(
+        matches!(
+            &overflow,
+            Err(ShaderError::Unsupported { what, .. })
+                if *what == "a lane permute across two host waves (not enough LDS)"
+        ),
+        "expected LDS overflow refusal, got {:?}",
+        overflow.err()
+    );
 }
