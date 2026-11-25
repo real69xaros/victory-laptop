@@ -718,6 +718,13 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// When its memory was last seen mapped (`crate::host::now_ms`), or the
+    /// frame it was written in for one never seen mapped. A slot whose pages
+    /// are gone keeps its host copy for a while ([`TextureQueue::away`])
+    /// before the slot is nulled: a null slot samples nothing, and a
+    /// texture streamed out for a frame or two came back with white or red
+    /// where it used to be.
+    mapped_at: u64,
 }
 
 thread_local! {
@@ -747,9 +754,10 @@ impl TextureQueue {
         if seen && self.slots.contains_key(&index) {
             return;
         }
+        let now = crate::host::now_ms();
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mapped_at: now });
     }
 
     fn remove(&mut self, index: u32) {
@@ -848,6 +856,8 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            // Bytes of it were there at this look.
+            w.mapped_at = crate::host::now_ms();
         }
     }
 
@@ -905,7 +915,17 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mapped_at: crate::host::now_ms() });
+    }
+
+    /// How long slot `index`'s memory has been away (not seen mapped), in
+    /// milliseconds; `None` if the slot is not in the queue. A slot keeps
+    /// its host copy while this is under the grace the pass allows
+    /// ([`TextureQueue::away`] is asked by the caller of
+    /// [`HostHeap::texture_slot_gone`]).
+    fn away(&self, index: u32) -> Option<u64> {
+        let w = self.slots.get(&index)?;
+        Some(crate::host::now_ms().saturating_sub(w.mapped_at))
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1477,6 +1497,15 @@ impl HostHeap {
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    }
+
+    /// How long title slot `index`'s memory has been away, in milliseconds;
+    /// `None` if the slot is not in the queue. The pass keeps the host copy
+    /// of a slot that has been away for less than its grace: the title
+    /// streams a texture's pages out and back in, and a null slot in
+    /// between samples nothing (the white arms and the red face are that).
+    pub(crate) fn texture_slot_away(&self, index: u32) -> Option<u64> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).away(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
