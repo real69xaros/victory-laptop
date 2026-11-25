@@ -1879,7 +1879,24 @@ impl State {
             once!("no ambient light: no view");
             return false;
         }
-        crate::ambient::raise(list, light as This)
+        let depth = stage
+            .translated()
+            .used
+            .iter()
+            .find(|u| {
+                u.kind == ResourceType::Srv
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == crate::ambient::DEPTH
+            })
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
+                _ => None,
+            })
+            .and_then(|v| match v {
+                View::Shader(r, _) => Some(r as This),
+                _ => None,
+            });
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
