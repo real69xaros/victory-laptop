@@ -1238,9 +1238,7 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    if crate::resource::dropped(src.resource) > 0 {
-        return Err("a texture whose host copy leaves out levels");
-    }
+    let index = crate::resource::readback_subresource(src.resource, src.footprint.offset as u32)?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1252,6 +1250,7 @@ fn read_back(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
+    from.footprint.offset = u64::from(index);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;

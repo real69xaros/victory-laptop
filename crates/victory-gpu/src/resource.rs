@@ -1362,6 +1362,20 @@ pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
     (mip >= drop).then(|| mip - drop + slice * (mips - drop))
 }
 
+/// Maps a readback before creating a host texture. Ordinary textures keep
+/// their native subresource numbering. Shrunken textures support plane zero.
+#[cfg(windows)]
+pub(crate) fn readback_subresource(this: This, index: u32) -> Result<u32, &'static str> {
+    if dropped(this) == 0 {
+        return Ok(index);
+    }
+    let desc = &resource(this).desc;
+    if index >= u32::from(desc.mip_levels) * u32::from(desc.depth_or_array_size) {
+        return Err("a read back outside the first plane of the host texture");
+    }
+    host_subresource(this, index).ok_or("a mip level omitted from the host texture")
+}
+
 /// A shader view's first level, level count and smallest-level clamp
 /// (`first`, `levels`, `clamp`) on a host texture that leaves out `drop`
 /// title levels: the same texels where they are there, else the host's
@@ -3672,6 +3686,158 @@ mod tests {
         drop(held);
         assert!(!textures().contains(&(source as usize)), "the last reference frees it");
         resource_release(view);
+    #[cfg(windows)]
+    #[test]
+    fn retained_array_mip_readback_preserves_box_and_buffer_layout() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipping readback");
+            return;
+        };
+        let null = std::ptr::null();
+        let make = |desc: ResourceDesc, state| {
+            let mut resource = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    state,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut resource
+                ),
+                S_OK
+            );
+            resource
+        };
+        let desc = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(512, 512, 28, 8)
+        };
+        let image = make(desc, 0x400); // COPY_DEST
+        // The selected second-slice mip must move when the mode is active.
+        // SAFETY: the resource owns this host texture.
+        let host_desc = unsafe { host_resource(image).unwrap().GetDesc() };
+        let drop = dropped(image);
+        assert_eq!(
+            (
+                host_desc.Width,
+                host_desc.Height,
+                host_desc.DepthOrArraySize,
+                host_desc.MipLevels
+            ),
+            (512 >> drop, 512 >> drop, 2, 8 - drop as u16)
+        );
+        if std::env::var("VICTORY_TEXTURE_DROP_MIPS").as_deref() == Ok("1") {
+            assert_eq!(drop, 1);
+        }
+        let source = make(buffer(2048), 0);
+        let output = make(buffer(4096), 0);
+        let (input, _) = buffer_bytes(source).unwrap();
+        let (result, _) = buffer_bytes(output).unwrap();
+        // The mip is 4x4 RGBA8. Give each slice a different pattern.
+        let pattern = |slice: usize, row: usize, byte: usize| (slice * 83 + row * 17 + byte) as u8;
+        // SAFETY: both committed buffers have the requested sizes.
+        unsafe {
+            result.write_bytes(0xa5, 4096);
+            for slice in 0..2 {
+                for row in 0..4 {
+                    for byte in 0..16 {
+                        input
+                            .add(slice * 1024 + row * 256 + byte)
+                            .write(pattern(slice, row, byte));
+                    }
+                }
+            }
+        }
+
+        let (mut allocator, mut list) = (null, null);
+        // Allocators and lists both expose the device-child interface.
+        let iid = &PAGEABLE_IIDS[1];
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let footprint = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let mip = |index| Location {
+            resource: image,
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: index,
+                ..footprint
+            },
+        };
+        let upload = |offset| Location {
+            resource: source,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset,
+                ..footprint
+            },
+        };
+        let read = |offset| Location {
+            resource: output,
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset,
+                width: 2,
+                height: 2,
+                row_pitch: 512,
+                ..footprint
+            },
+        };
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        let copy = slot::<Copy>(list, 0x80);
+        copy(list, &mip(7), 0, 0, 0, &upload(0), std::ptr::null());
+        copy(list, &mip(15), 0, 0, 0, &upload(1024), std::ptr::null());
+        let region = [1, 1, 0, 3, 3, 1];
+        copy(list, &read(512), 0, 0, 0, &mip(15), &region);
+        copy(list, &read(2048), 0, 0, 0, &mip(7), &region);
+        if drop > 0 {
+            // A discarded level has no pixels; the destination stays intact.
+            copy(list, &read(3072), 0, 0, 0, &mip(0), &region);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+
+        let mut expected = [0xa5; 4096];
+        for (slice, start) in [(1, 512), (0, 2048)] {
+            for row in 0..2 {
+                for byte in 0..8 {
+                    expected[start + row * 512 + byte] = pattern(slice, row + 1, byte + 4);
+                }
+            }
+        }
+        // SAFETY: execute waits for the recorded copies and their writeback.
+        let actual = unsafe { std::slice::from_raw_parts(result, 4096) };
+        for (at, (&got, want)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(got, want, "retained mip readback at byte {at}");
+        }
+        for object in [list, allocator, output, source, image] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
