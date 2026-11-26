@@ -363,6 +363,29 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// A parallel landing cannot order writes through two title views of one
+/// physical page. Check the mapped part of each span against the same
+/// section-page index the write guards use.
+pub(crate) fn touches_aliased_page(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
+    let v = views();
+    if v.views.is_empty() {
+        return false;
+    }
+    ranges.filter(|(lo, hi)| lo < hi).any(|(lo, hi)| {
+        let first = v.views.range(..=lo).next_back().map_or(lo, |(&base, _)| base);
+        v.views.range(first..hi).any(|(&base, &(bytes, section, offset))| {
+            let end = hi.min(base + bytes);
+            let begin = lo.max(base);
+            if begin >= end {
+                return false;
+            }
+            let page = offset + ((begin - base) / K64 * K64) as u64;
+            let last = offset + (end - base) as u64;
+            v.pages.range((section, page)..(section, last)).any(|(_, addresses)| addresses.len() > 1)
+        })
+    })
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

@@ -2893,7 +2893,7 @@ const MERGE_BUCKETS: usize = 8;
 fn separate_ranges(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
     let mut ranges: Vec<_> = ranges.filter(|(lo, hi)| lo < hi).collect();
     ranges.sort_unstable();
-    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0) && !crate::inplace::touches_aliased_page(ranges.into_iter())
 }
 
 #[cfg(test)]
@@ -2905,6 +2905,39 @@ mod relay_bucket_tests {
     fn adjacent_cpu_spans_can_land_together() {
         assert!(separate_ranges([(9, 12), (2, 9), (7, 7)].into_iter()));
         assert!(!separate_ranges([(2, 10), (4, 7)].into_iter()));
+    }
+
+    /// Two different virtual ranges can still update the same byte.
+    #[test]
+    fn two_views_of_one_page_take_the_ordered_landing() {
+        use windows_sys::Win32::{Foundation, System::Memory as mem};
+        // SAFETY: both views are of the test's own committed anonymous section.
+        unsafe {
+            let section = mem::CreateFileMappingW(Foundation::INVALID_HANDLE_VALUE, std::ptr::null(),
+                mem::PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let first = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            let other = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, PAGE);
+            assert!(!first.Value.is_null() && !other.Value.is_null());
+            let (a, b) = (first.Value as usize, other.Value as usize);
+            crate::inplace::title_memory_view(a, 2 * PAGE, section as usize, 0);
+            crate::inplace::title_memory_view(b, PAGE, section as usize, 0);
+            let writes = [(a + 7, a + 12), (b + 9, b + 11)];
+            let parallel = separate_ranges(writes.into_iter());
+            let second_page = crate::inplace::touches_aliased_page([(a + PAGE, a + PAGE + 1)].into_iter());
+            for ((lo, hi), byte) in writes.into_iter().zip([1u8, 2]) {
+                std::ptr::write_bytes(lo as *mut u8, byte, hi - lo);
+            }
+            let result = std::slice::from_raw_parts((a + 7) as *const u8, 5).to_vec();
+            crate::inplace::views_gone(b, PAGE);
+            let after_unmap = crate::inplace::touches_aliased_page([(a, a + 1)].into_iter());
+            crate::inplace::views_gone(a, 2 * PAGE);
+            mem::UnmapViewOfFile(other);
+            mem::UnmapViewOfFile(first);
+            Foundation::CloseHandle(section);
+            assert!(!parallel && !second_page && !after_unmap);
+            assert_eq!(result, [1, 1, 2, 2, 1]);
+        }
     }
 
     #[test]
@@ -6189,7 +6222,12 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let written = if wide_merge() && pieces.len() >= 8 {
+        let written = if wide_merge() && pieces.len() >= 8 && !crate::inplace::touches_aliased_page(
+            pieces.iter().map(|(shadow, lo, hi, _)| {
+                let start = shadow.span().0 as usize;
+                (start + lo, start + hi)
+            }),
+        ) {
             let mut buckets: [Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>; MERGE_BUCKETS] =
                 std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at) in pieces {
@@ -6367,7 +6405,12 @@ impl Host {
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
         let piece_count = pieces.len();
-        let (written, bytes) = if wide_merge() && piece_count >= 8 {
+        let (written, bytes) = if wide_merge() && piece_count >= 8 && !crate::inplace::touches_aliased_page(
+            pieces.iter().map(|(shadow, lo, hi, _, _)| {
+                let start = shadow.span().0 as usize;
+                (start + lo, start + hi)
+            }),
+        ) {
             let mut buckets: [Vec<Piece>; MERGE_BUCKETS] = std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at, after) in pieces {
                 let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
@@ -6651,7 +6694,10 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
+            if wide_merge() && pieces.len() >= 8 && separate_ranges(pieces.iter().map(|&(i, lo, hi, _)| {
+                let start = plan.ranges[i].shadow.span().0 as usize;
+                (start + lo, start + hi)
+            })) {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
