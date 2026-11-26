@@ -10419,6 +10419,19 @@ impl Host {
                     // present of the Series S profile returned before it was drawn).
                     list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
                     crate::fpsbox::draw(self, list, &back, (p.width, p.height, p.format));
+                    // The frame captures (`VICTORY_CAPTURE`) of the blended planes: the
+                    // two-plane present returned before they were read back too.
+                    #[cfg(feature = "diagnostics")]
+                    let capture = if crate::capture::wanted(frame) {
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        let read = crate::capture::read_back(&self.device, list, &back);
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                        read
+                    } else {
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
+                        None
+                    };
+                    #[cfg(not(feature = "diagnostics"))]
                     list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
                     copy.close();
                     match slot {
@@ -10427,6 +10440,10 @@ impl Host {
                             p.ahead[i].1 = flown;
                         }
                         None => self.execute(&[copy]),
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((buffer, footprint)) = capture {
+                        crate::capture::save_read_back(frame, &buffer, &footprint);
                     }
                     let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     p.meter.frame(p.hwnd);
