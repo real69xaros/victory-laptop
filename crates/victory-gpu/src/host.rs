@@ -10090,6 +10090,11 @@ impl Host {
                         overlay,
                         overlay_state,
                     );
+                    // The frame rate box over the blended planes too (the two-plane
+                    // present of the Series S profile returned before it was drawn).
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    crate::fpsbox::draw(self, list, &back, (p.width, p.height, p.format));
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
                     copy.close();
                     match slot {
                         Some(i) => {
