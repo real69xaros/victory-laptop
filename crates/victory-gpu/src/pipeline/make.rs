@@ -73,6 +73,15 @@ pub(crate) struct Pending {
     /// ([`for_formats`]): a chain from the title's pipeline, one link per
     /// set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// The title frame in which a thread first waited for it (`u64::MAX`:
+    /// none yet). A pipeline is waited for in one frame only: one the
+    /// worker has not made within that frame's budget (a slow or stuck
+    /// driver compile) is dropped in later frames until it is made, instead
+    /// of taking the whole budget again in every frame that draws with it
+    /// (#1181: 500 ms waited in every world frame, felt as a freeze while
+    /// the player moves). `VICTORY_PIPELINE_WAIT_EVERY_FRAME=1` waits in
+    /// every frame as before.
+    waited_frame: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -99,6 +108,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             handed: AtomicBool::new(false),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -279,6 +289,25 @@ pub(crate) fn early(p: &Arc<Pending>) {
 /// of waiting in every frame in which pipelines were being made (runs
 /// 34-49: "2504 ms waiting for pipelines" in each such frame).
 /// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
+/// Whether a pipeline is waited for in every frame that draws with it (the
+/// old behaviour), not only in the first one that had budget for it.
+fn wait_every_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
+}
+
+/// Claims frame `frame` as the one in which `p` is waited for; whether
+/// `frame` is (or already was) that frame.
+fn claim_wait(p: &Pending, frame: u64) -> bool {
+    if wait_every_frame() {
+        return true;
+    }
+    match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(first) => first == frame,
+    }
+}
+
 fn shared_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
@@ -300,14 +329,16 @@ fn wait(p: &Pending, frame: u64) {
             *spent = (frame, Duration::ZERO);
         }
         let left = budget.saturating_sub(spent.1);
+        // Claimed only with time left, so a pipeline first bound when the
+        // frame's budget is spent keeps its one wait for a later frame.
+        if left.is_zero() || !claim_wait(p, frame) {
+            return;
+        }
         if shared {
             spent.1 += left;
         }
         left
     };
-    if left.is_zero() {
-        return;
-    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -563,5 +594,33 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// A pipeline still being made that was waited for in an earlier frame
+    /// is not waited for again (#1181).
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame_only() {
+        let p = Pending::new(Vec::new(), None);
+        // Claimed by a worker that has not finished.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let frame = crate::frame::current();
+        // Another frame than this one, and never `u64::MAX` (none yet): with
+        // the frame counter still at 0, `0 - 1` would be that.
+        p.waited_frame.store(frame.wrapping_add(1), Ordering::Relaxed);
+        let p = Arc::new(p);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
+    }
+
+    /// The claim: the first frame keeps it, the same frame may wait again
+    /// (several draws in one frame), a later frame may not.
+    #[test]
+    fn the_first_frame_claims_the_wait() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(claim_wait(&p, 7));
+        assert!(claim_wait(&p, 7));
+        assert!(!claim_wait(&p, 8));
+        assert_eq!(p.waited_frame.load(Ordering::Relaxed), 7);
     }
 }
