@@ -41,6 +41,13 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// `alt`: twenty seconds with, twenty without, in turn, each change said
 /// in the log.
+/// Whether [`HostHeap::mirror`] makes a draw's host texture before the
+/// slots' lock (`VICTORY_PREMAKE=0`: under it, as before; on by default).
+fn premake() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREMAKE").is_none_or(|v| v != "0"))
+}
+
 fn heap_locks() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     /// 0 off, 1 on, 2 in turn.
@@ -2462,6 +2469,32 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             mirror_how(MIRROR_FAST);
             return Some(view);
+        }
+        // The host texture a draw's view needs is made before the slots'
+        // lock, not under it (`VICTORY_PREMAKE=0`: under it, as before).
+        // Making one is a `CreateCommittedResource`, milliseconds, and every
+        // other recording thread that needed a slot waited behind it (46 ms
+        // a frame of the recording threads in the profile of run DATH3).
+        // `host_resource` makes it once under the texture's own lock and
+        // hands back the same one after; under the lock `make` then only
+        // writes the descriptor. Only for draws: other askings leave
+        // textures without a host copy waiting on purpose.
+        if for_draw
+            && tag == VIEW_TAG
+            && premake()
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) != key
+        {
+            match view_at(i, generation) {
+                Some(View::Shader(resource, _)) => {
+                    let _ = crate::resource::host_resource(resource as crate::object::This);
+                }
+                Some(placed @ View::Placed(false, ..)) => {
+                    if let Some(View::Shader(resource, _)) = placed_texture(&placed) {
+                        let _ = crate::resource::host_resource(resource as crate::object::This);
+                    }
+                }
+                _ => {}
+            }
         }
         let mut made = locked(&self.made, 4);
         #[cfg(feature = "diagnostics")]
