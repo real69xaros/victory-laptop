@@ -2623,8 +2623,9 @@ pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
         let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         loose
-            .values()
-            .map(|s| {
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(_, s)| {
                 let low = s.asked[0].load(Ordering::Relaxed);
                 let high = s.asked[1].load(Ordering::Relaxed);
                 high.saturating_sub(low)
@@ -2646,7 +2647,14 @@ pub(crate) fn windows() -> [u64; 3] {
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut refs_in_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for s in loose.values() {
+        *refs_in_map.entry(Arc::as_ptr(s) as usize).or_insert(0) += 1;
+    }
+    for (&(ks, kl), s) in loose.iter() {
+        if ks != s.start || kl != s.len {
+            continue;
+        }
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
@@ -2654,7 +2662,8 @@ pub(crate) fn window_use() -> [u64; 8] {
             out[1] += 1;
             out[2] += s.len;
         }
-        if Arc::strong_count(s) > 1 {
+        let in_map = refs_in_map.get(&(Arc::as_ptr(s) as usize)).copied().unwrap_or(1);
+        if Arc::strong_count(s) > in_map {
             out[3] += 1;
             out[4] += s.len;
         }
@@ -2665,6 +2674,17 @@ pub(crate) fn window_use() -> [u64; 8] {
     }
     out[7] = window();
     out
+}
+
+/// Groups every key in `map` by the identity of the `Arc<T>` it holds:
+/// needed when a single copy stands under several keys (canonical +
+/// aliases, [`window_reuse`]).
+fn group_by_ptr<T>(map: &BTreeMap<(u64, u64), Arc<T>>) -> std::collections::HashMap<usize, Vec<(u64, u64)>> {
+    let mut groups: std::collections::HashMap<usize, Vec<(u64, u64)>> = std::collections::HashMap::new();
+    for (&key, val) in map {
+        groups.entry(Arc::as_ptr(val) as usize).or_default().push(key);
+    }
+    groups
 }
 
 /// Lets go of the copies of windows outside buffers that nothing names any
@@ -2691,23 +2711,35 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle = |s: &Arc<Shadow>| {
-            Arc::strong_count(s) == 1
+        let groups = group_by_ptr(&map);
+        let idle = |s: &Arc<Shadow>, in_map: usize| {
+            Arc::strong_count(s) == in_map
                 && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                 && crate::host::references(&s.buffer) == 1
         };
-        let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
+        let candidates: Vec<Vec<(u64, u64)>> = groups
+            .into_values()
+            .filter(|keys| map.get(&keys[0]).is_some_and(|s| idle(s, keys.len())))
+            .collect();
         // Counted before they leave the table, with its lock held, and
         // each looked at AGAIN after the count ([`TABLES_CHANGED`]): a
         // thread that took one from its own memory of asks before the
         // count moved holds it by now, and it stays.
-        if !keys.is_empty() {
+        if !candidates.is_empty() {
             tables_changed();
         }
         let mut gone = Vec::new();
-        for key in keys {
-            if map.get(&key).is_some_and(&idle) {
-                gone.extend(map.remove(&key));
+        for keys in candidates {
+            if map.get(&keys[0]).is_some_and(|s| idle(s, keys.len())) {
+                let mut removed = None;
+                for key in keys {
+                    if let Some(s) = map.remove(&key) {
+                        removed.get_or_insert(s);
+                    }
+                }
+                if let Some(s) = removed {
+                    gone.push(s);
+                }
             }
         }
         gone
@@ -4230,15 +4262,31 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
+        let max_len = MAX_LOOSE_LEN.load(Ordering::Relaxed);
+        let hit_ptrs: std::collections::HashSet<usize> = map
+            .range((at.saturating_sub(max_len), 0)..(end, 0))
+            .filter(|(_, shadow)| shadow.place.is_some() && shadow.start < end && shadow.start + shadow.len > at)
+            .map(|(_, shadow)| Arc::as_ptr(shadow) as usize)
             .collect();
+        let keys: Vec<(u64, u64)> = if hit_ptrs.is_empty() {
+            Vec::new()
+        } else {
+            map.iter()
+                .filter(|(_, shadow)| hit_ptrs.contains(&(Arc::as_ptr(shadow) as usize)))
+                .map(|(key, _)| *key)
+                .collect()
+        };
         if !keys.is_empty() {
             tables_changed();
         }
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        let mut seen = std::collections::HashSet::new();
+        for key in keys {
+            if let Some(shadow) = map.remove(&key)
+                && seen.insert(Arc::as_ptr(&shadow) as usize)
+            {
+                gone.push(shadow);
+            }
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -4266,7 +4314,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
+    spans.extend(
+        loose
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&(start, len), _)| (start, len, true)),
+    );
     spans
 }
 
@@ -4644,6 +4697,101 @@ fn fine() -> bool {
     tails() || window() < WINDOW
 }
 
+/// Whether a sized ask for loose title memory (`find`) reuses an existing
+/// containing window by aliasing its grid key to that window instead of
+/// allocating a duplicate host buffer, and immediately reclaims unused
+/// smaller windows strictly superseded by a newly allocated larger window
+/// (`VICTORY_WINDOW_REUSE=1`; off by default).
+///
+/// With a finer grid (`VICTORY_WINDOW_KB` below 4096) and/or tails
+/// (`VICTORY_WINDOW_TAILS=1`), a root view's tail or a multi-cell window
+/// often already covers a descriptor view's grid cell. Previously `find`
+/// allocated a separate overlapping buffer for every grid key, duplicating
+/// up to ~1 GiB of loose windows. Storing the grid key as an alias to the
+/// existing `Arc<Shadow>` preserves the invariant that `make` and
+/// `buffer_copy` always resolve the same key to the exact same host copy.
+fn window_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_REUSE").is_some_and(|v| v == "1"))
+}
+
+/// Largest loose window length allocated so far, so range searches for a
+/// containing window also find windows larger than `WINDOW`.
+static MAX_LOOSE_LEN: AtomicU64 = AtomicU64::new(WINDOW);
+
+/// Since the start (`VICTORY_WINDOW_REUSE=1`): duplicate windows avoided via
+/// key aliasing, their bytes, unused superseded windows reclaimed right away,
+/// and their bytes.
+static WINDOW_REUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Of `windows` (start, bytes), those strictly contained inside `[start,
+/// start + len)` (excluding `(start, len)` itself).
+fn strictly_inside(windows: impl Iterator<Item = (u64, u64)>, start: u64, len: u64) -> Vec<(u64, u64)> {
+    let end = start.saturating_add(len);
+    windows
+        .filter(|&(ks, kl)| ks >= start && ks.saturating_add(kl) <= end && (ks, kl) != (start, len))
+        .collect()
+}
+
+/// Reclaims any canonical windows in `map` strictly inside `[start, start +
+/// len)` that are held by `map` alone (no list, no heap pass, no descriptor
+/// slot), using the same `tables_changed()` double-check as [`let_go_idle`].
+fn reclaim_superseded(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, start: u64, len: u64) -> Vec<Arc<Shadow>> {
+    let end = start.saturating_add(len);
+    let inner_canonical = strictly_inside(
+        map.range((start, 0)..(end, 0))
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&k, _)| k),
+        start,
+        len,
+    );
+    if inner_canonical.is_empty() {
+        return Vec::new();
+    }
+    let inner_ptrs: std::collections::HashSet<usize> = inner_canonical
+        .iter()
+        .filter_map(|k| map.get(k).map(|s| Arc::as_ptr(s) as usize))
+        .collect();
+    // Every alias of a window strictly inside `[start, end)` has its key
+    // inside `[start, end)` as well, because an alias key is always a subspan
+    // of the window it points to.
+    let mut by_ptr: std::collections::HashMap<usize, Vec<(u64, u64)>> = std::collections::HashMap::new();
+    for (&k, s) in map.range((start, 0)..(end, 0)) {
+        let ptr = Arc::as_ptr(s) as usize;
+        if inner_ptrs.contains(&ptr) {
+            by_ptr.entry(ptr).or_default().push(k);
+        }
+    }
+    let unused = |s: &Arc<Shadow>, in_map: usize| {
+        Arc::strong_count(s) == in_map && crate::host::references(&s.buffer) == 1
+    };
+    let candidates: Vec<Vec<(u64, u64)>> = by_ptr
+        .into_values()
+        .filter(|keys| map.get(&keys[0]).is_some_and(|s| unused(s, keys.len())))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    tables_changed();
+    let mut gone = Vec::new();
+    for keys in candidates {
+        if map.get(&keys[0]).is_some_and(|s| unused(s, keys.len())) {
+            let mut removed = None;
+            for key in keys {
+                if let Some(s) = map.remove(&key) {
+                    removed.get_or_insert(s);
+                }
+            }
+            if let Some(s) = removed {
+                WINDOW_REUSED[2].fetch_add(1, Ordering::Relaxed);
+                WINDOW_REUSED[3].fetch_add(s.len, Ordering::Relaxed);
+                gone.push(s);
+            }
+        }
+    }
+    gone
+}
+
 /// For the memory line: the bytes of title memory the windows alive lie
 /// over (each byte once), beside the windows' own bytes in
 /// [`memory`]: the difference is memory that is in more than one window,
@@ -4651,7 +4799,12 @@ fn fine() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    cover(loose.keys().copied())
+    cover(
+        loose
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(&k, _)| k),
+    )
 }
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
@@ -4683,22 +4836,20 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+fn canonical_in(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    from: u64,
+    to: u64,
+) -> impl Iterator<Item = (u64, u64)> + '_ {
+    map.range((from, 0)..=(to, u64::MAX))
+        .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+        .map(|(&k, _)| k)
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
@@ -4708,17 +4859,64 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let reuse = window_reuse();
+    let max_len = MAX_LOOSE_LEN.load(Ordering::Relaxed);
+    let (start, len) = if unsized_ask && tails() {
+        longest_tail(canonical_in(&map, cell, address), address, end).unwrap_or_else(|| tail_of(address, end))
+    } else if any && fine() && !unsized_ask {
+        // The windows that begin in the ask's cell at or below the ask (or,
+        // with `VICTORY_WINDOW_REUSE=1`, any larger window reaching across
+        // the cell line).
+        let from = if reuse { address.saturating_sub(max_len) } else { cell };
+        holder(canonical_in(&map, from, address), address, end).unwrap_or(named)
+    } else if !unsized_ask && reuse {
+        if let Some(shadow) = map.get(&named) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        let from = named.0.saturating_sub(max_len);
+        if let Some(existing) = holder(canonical_in(&map, from, named.0), named.0, named.0 + named.1)
+            && let Some(shadow) = map.get(&existing).cloned()
+        {
+            note(&shadow);
+            map.insert(named, shadow.clone());
+            tables_changed();
+            let n = WINDOW_REUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let saved = WINDOW_REUSED[1].fetch_add(named.1, Ordering::Relaxed) + named.1;
+            if n == 1 || n.is_multiple_of(64) {
+                tracing::info!(
+                    "loose windows reused via alias (VICTORY_WINDOW_REUSE=1): {n} duplicate buffers avoided ({} MB saved), {} superseded windows reclaimed ({} MB)",
+                    saved >> 20,
+                    WINDOW_REUSED[2].load(Ordering::Relaxed),
+                    WINDOW_REUSED[3].load(Ordering::Relaxed) >> 20,
+                );
+            }
+            return Some(shadow);
+        }
+        named
+    } else {
+        named
+    };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
     }
+    let insert_and_reclaim = |map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, shadow: Arc<Shadow>| -> (Arc<Shadow>, Vec<Arc<Shadow>>) {
+        note(&shadow);
+        MAX_LOOSE_LEN.fetch_max(len, Ordering::Relaxed);
+        map.insert((start, len), shadow.clone());
+        tables_changed();
+        let retired = if reuse { reclaim_superseded(map, start, len) } else { Vec::new() };
+        (shadow, retired)
+    };
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        tables_changed();
+        let (shadow, retired) = insert_and_reclaim(&mut map, Arc::new(Shadow::placed(placed, start, len, true)));
+        drop(map);
+        for old in retired {
+            crate::host::retire(old);
+        }
         return Some(shadow);
     }
     // In a GPU upload heap, if asked for and there is room: one buffer in
@@ -4730,10 +4928,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.uploaded = len;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        tables_changed();
+        let (shadow, retired) = insert_and_reclaim(&mut map, Arc::new(shadow));
+        drop(map);
+        for old in retired {
+            crate::host::retire(old);
+        }
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4770,9 +4969,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let _ = card.me.set(Arc::downgrade(&shadow));
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    tables_changed();
+    let (shadow, retired) = insert_and_reclaim(&mut map, shadow);
+    drop(map);
+    for old in retired {
+        crate::host::retire(old);
+    }
     Some(shadow)
 }
 
@@ -4854,7 +5055,9 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, grid, group_by_ptr, holder, longest_tail, strictly_inside, tail_of, window_of};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -4955,6 +5158,53 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// Strictly contained windows are identified for reclamation while self
+    /// and partially overlapping windows are untouched.
+    #[test]
+    fn strictly_inside_finds_only_contained_windows() {
+        let cell = 0xd_1200_0000u64;
+        let all = [
+            (cell, WINDOW),                  // self
+            (cell + 0x10_0000, 0x30_0000),   // shorter tail inside
+            (cell + 0x20_0000, 0x10_0000),   // grid cell inside
+            (cell + 0x30_0000, 0x20_0000),   // extends past cell end
+            (cell - 0x10_0000, 0x20_0000),   // begins before cell
+        ];
+        assert_eq!(
+            strictly_inside(all.into_iter(), cell, WINDOW),
+            vec![(cell + 0x10_0000, 0x30_0000), (cell + 0x20_0000, 0x10_0000)]
+        );
+    }
+
+    /// Grouping by Arc pointer tracks every alias key belonging to a reused
+    /// window so idle eviction checks `strong_count == keys.len()` and drops
+    /// all keys together.
+    #[test]
+    fn alias_grouping_tracks_all_keys_per_copy() {
+        let cell = 0xd_1200_0000u64;
+        let tail = Arc::new(1u64);
+        let other = Arc::new(2u64);
+        let mut map = BTreeMap::new();
+        map.insert((cell + 0x10_0000, 0x30_0000), tail.clone());
+        map.insert((cell + 0x10_0000, 0x4_0000), tail.clone());
+        map.insert((cell + 0x20_0000, 0x4_0000), tail.clone());
+        map.insert((cell + 0x40_0000, 0x4_0000), other.clone());
+        let groups = group_by_ptr(&map);
+        let tail_keys = &groups[&(Arc::as_ptr(&tail) as usize)];
+        assert_eq!(tail_keys.len(), 3);
+        // External local `tail` makes strong_count 4 > 3 (not idle yet).
+        assert_eq!(Arc::strong_count(&tail), 4);
+        let tail_ptr = Arc::as_ptr(&tail) as usize;
+        drop(tail);
+        // Now only the 3 map entries hold it: strong_count == keys.len().
+        assert_eq!(Arc::strong_count(&map[&tail_keys[0]]), tail_keys.len());
+        assert_eq!(groups[&(Arc::as_ptr(&other) as usize)].len(), 1);
+        for k in tail_keys {
+            assert_eq!(Arc::as_ptr(&map.remove(k).unwrap()) as usize, tail_ptr);
+        }
+        assert_eq!(map.len(), 1);
     }
 }
 
@@ -5067,8 +5317,9 @@ pub(crate) fn near(va: u64) -> String {
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .iter()
+            .filter(|&(&(ks, kl), s)| ks == s.start && kl == s.len)
+            .map(|(_, s)| (s.gpu, s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
