@@ -349,11 +349,15 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// object `out` names and draws with it. They are the console's
+/// pipelines from precompiled binaries (code and metadata per stage, the
+/// title's root signature, a register image), called in one burst while
+/// loading: a cache. On failure the title makes the same pipeline later the
+/// usual way (`create_stream`), so nothing goes missing (run 335: every call
+/// in the first 36 s, then 727 mesh and 1,016 pixel pipelines made normally;
+/// upstream VIctory #3163 says the same, and that answering them made things
+/// worse there). The calls fail as they always did, with `out` null, and the
+/// first ones log what the description holds.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -430,14 +434,16 @@ fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
         let mut b = vec![0u8; n];
         (at != 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
     };
-    let Some(d) = read(desc, 0x80) else {
+    let Some(d) = read(desc, 0x100) else {
         return;
     };
     let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
-    let key = if slot == 0x218 { w(11) } else { w(5) ^ (w(9) << 1) };
+    // 0x218: its code pointer (word 11 is not a key: gfx41); 0x1c8: the
+    // code pointers of words 5 and 9.
+    let key = if slot == 0x218 { w(5) } else { w(5) ^ (w(9) << 1) };
     {
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(&(slot, key)) || seen.len() >= 4096 {
+        if seen.contains(&(slot, key)) || seen.len() >= 16384 {
             return;
         }
         seen.push((slot, key));
@@ -448,7 +454,19 @@ fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
     if let Some(r) = read(w(0) as usize, 0x80) {
         let _ = std::fs::write(sub.join("root.bin"), r);
     }
-    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11] };
+    // The root signature's serialized form, once per root object.
+    {
+        static ROOTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if !roots.contains(&w(0)) {
+            roots.push(w(0));
+            if let Some(b) = crate::root::blob(w(0) as usize as crate::object::This) {
+                let _ = std::fs::create_dir_all(dir.join("roots"));
+                let _ = std::fs::write(dir.join("roots").join(format!("{:x}.bin", w(0))), b);
+            }
+        }
+    }
+    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11, 13, 15] };
     for &i in pairs {
         let (at, size) = (w(i) as usize, w(i + 1) as usize);
         if at == 0 || size == 0 || size > 1 << 20 {

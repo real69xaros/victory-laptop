@@ -51,6 +51,9 @@ cbuffer Record : register(b0) {
     // Bit 3: dispatch records spread across z past 65,535 groups in x
     // (`crate::draw`'s spread command signature): record i goes to byte
     // 20 * i as [row, asked x, x, y, z], row 0 when not spread.
+    // Bit 4, with bit 2: the table's first word is the number of records
+    // (a window, `windowed`: the CPU adds records while the list is
+    // recorded), the offsets follow it.
     uint has_count;
     uint count_offset;
 };
@@ -84,6 +87,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+    bool counted_table = (has_count & 16u) != 0;
+    if (counted_table) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
     bool active = id.x < eff_count;
@@ -92,7 +99,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // is a count of four bytes, or the source itself, and is not read here.)
     [branch]
     if ((has_count & 4u) != 0) {
-        src_at = count_buf.Load(count_offset + id.x * 4u);
+        src_at = count_buf.Load(count_offset + (counted_table ? 4u : 0u) + id.x * 4u);
     }
     uint dst_at = id.x * stride;
     bool spread = (has_count & 8u) != 0;
@@ -385,6 +392,8 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
     spread: bool,
 ) -> Option<ID3D12Resource> {
+    // An open window first: its draws come before this, in order.
+    end_window(list);
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]).
     let bytes = if spread { bytes.max(20 * u64::from(spec.2)) } else { bytes };
@@ -407,6 +416,7 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    end_window(list);
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
@@ -620,6 +630,173 @@ fn clamp_lean() -> bool {
     }
 }
 
+/// Whether indirect draws are clamped a window at a time (`VICTORY_CLAMP_WINDOW=1`; off by default; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log). After Marvisak/VIctory #3197 (Slay326),
+/// ported onto this clamp: a window is one pass of the clamp's gather mode whose table the CPU fills while the
+/// list is recorded.
+///
+/// Without it every indirect draw that no ahead-window or gather serves has a pass of its own between two waits
+/// for every earlier shader write, so the card goes from drawing to compute and back for each.
+///
+/// With it the first such draw records ONE pass (`count` records in the table, at most [`WINDOW_SLOTS`]) where its
+/// single clamp would be, and the next ones that may join add their records to that pass's table and read them from
+/// the window's slots, with no pass, wait or pipeline change of their own.
+///
+/// Why every draw's arguments stay what its own clamp would read: the pass reads all the window's records at the
+/// window's place in the list. A draw joins only if nothing recorded since that place can have written buffers on
+/// the card: the window ends (`end_window`) at every dispatch, mesh dispatch, plain draw or indexed draw, every
+/// indirect draw that does not join (a dispatch, a count buffer, a spread, a pipeline that may store or that the
+/// layer does not know, another argument buffer, kind or stride, a full window), every texture or resource copy the
+/// list records, every single clamp, ahead window or gather, and the list's end and reset. The title's buffer
+/// copies and fills run on the CPU at submission, before the list, and the arguments' host copy is refreshed then
+/// too: they are the same for the pass as for each single clamp. The pass charges the list's budget record by
+/// record in the order of the draws, as the single clamps did one after the other.
+pub(crate) fn clamp_window() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_WINDOW").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "indirect draws are clamped a window at a time from now (VICTORY_CLAMP_WINDOW=alt): {}",
+                    if on { "ON" } else { "off, a pass for each as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Records a window clamps at most (a multiple of the clamp's 64 threads).
+const WINDOW_SLOTS: u32 = 256;
+
+/// Since the start: windows opened (passes), draws served, records.
+pub(crate) static WINDOWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether a window was ever opened (until then ending one takes no lock).
+static WINDOW_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A list's open window ([`clamp_window`]).
+pub(crate) struct Window {
+    /// The arguments' host copy (its GPU address), and the records' kind and stride: one of each a window.
+    src: u64,
+    kind: u32,
+    stride: u32,
+    /// The table: upload memory of the list, word 0 the records, then their byte offsets in `src`.
+    table: usize,
+    records: u32,
+    /// The list's scratch buffer, readable as indirect arguments until the next clamp into it.
+    dst: ID3D12Resource,
+}
+
+/// Ends `list`'s window, if one is open. Before anything that may write buffers on the card.
+pub(crate) fn end_window(list: &HostList) {
+    if !WINDOW_OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    *list.clamp_window() = None;
+}
+
+/// The clamped records of an indirect draw (no count buffer, not spread, shaders that cannot store): `records`
+/// records of `kind`, `stride` bytes apart from `offset` in the host copy `src`, in `list`'s open window or in one
+/// opened for it. Returns the scratch buffer, the records' byte offset in it, and whether a pass was recorded (it
+/// replaced the list's compute root signature and pipeline). `None`: the caller clamps the draw on its own.
+pub(crate) fn windowed(
+    list: &HostList,
+    (src, offset): (&ID3D12Resource, u64),
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: a live D3D12 buffer resource.
+    let src_gpu = unsafe { src.GetGPUVirtualAddress() };
+    if kind == 2 || records == 0 || records > WINDOW_SLOTS {
+        return None;
+    }
+    // Every record's offset fits the table's 32-bit words and the clamp's gathered form.
+    let last = offset.checked_add(u64::from(records - 1) * u64::from(stride))?;
+    gatherable(src_gpu, offset, (kind, stride))?;
+    gatherable(src_gpu, last, (kind, stride))?;
+    let mut slot = list.clamp_window();
+    let joins = slot
+        .as_ref()
+        .is_some_and(|w| w.src == src_gpu && w.kind == kind && w.stride == stride && w.records + records <= WINDOW_SLOTS);
+    let mut opened = false;
+    if !joins {
+        *slot = None;
+        let (c, budget) = (clamp()?, list.budget()?);
+        let dst = list.indirect_scratch(u64::from(WINDOW_SLOTS) * u64::from(stride))?;
+        let (table_gpu, table) = list.scratch(4 + 4 * u64::from(WINDOW_SLOTS))?;
+        // SAFETY: the first word of the list's fresh upload memory.
+        unsafe { (table as *mut u32).write_volatile(0) };
+        // SAFETY: a live D3D12 buffer resource.
+        let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+        if !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+            return None;
+        }
+        let before = list.indirect_state(&dst);
+        let constants = [kind, stride, WINDOW_SLOTS, 0u32, 4u32 | 16u32, 0u32];
+        let first = [uav_barrier(), transition(&dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+        let second = [
+            uav_barrier(),
+            transition(&dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ];
+        let l = &list.list;
+        let timed = crate::cardmeter::clamp_begin(l);
+        // SAFETY: an open list; our root signature and pipeline; the arguments' host copy (held by the list's
+        // refreshes), the table (the list's upload memory), the scratch and budget buffers. Threads past the
+        // table's count return at once and charge nothing.
+        unsafe {
+            l.ResourceBarrier(&first);
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, table_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.Dispatch(WINDOW_SLOTS / 64, 1, 1);
+            l.ResourceBarrier(&second);
+        }
+        crate::cardmeter::end(l, timed);
+        list.indirect_readable(&dst);
+        WINDOW_OPENED.store(true, Relaxed);
+        let opened_so_far = WINDOWS[0].fetch_add(1, Relaxed) + 1;
+        if opened_so_far.is_power_of_two() {
+            tracing::info!(
+                "clamp windows so far (VICTORY_CLAMP_WINDOW): {opened_so_far} passes served {} draws, {} records (draws per pass is what it saves)",
+                WINDOWS[1].load(Relaxed),
+                WINDOWS[2].load(Relaxed)
+            );
+        }
+        *slot = Some(Window { src: src_gpu, kind, stride, table: table as usize, records: 0, dst });
+        opened = true;
+    }
+    let w = slot.as_mut()?;
+    let first = w.records;
+    // SAFETY: the table's words lie in the list's upload memory, alive until it is reset; the card reads them
+    // only when the list runs. The count is written last.
+    unsafe {
+        let t = w.table as *mut u32;
+        for j in 0..records {
+            t.add(1 + (first + j) as usize).write_volatile((offset + u64::from(j) * u64::from(stride)) as u32);
+        }
+        w.records += records;
+        t.write_volatile(w.records);
+    }
+    WINDOWS[1].fetch_add(1, Relaxed);
+    WINDOWS[2].fetch_add(u64::from(records), Relaxed);
+    Some((w.dst.clone(), u64::from(first) * u64::from(stride), opened))
+}
+
 /// The most records of one argument buffer gathered for a list
 /// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
 /// threads past the last record read inside the table.
@@ -708,7 +885,11 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+///
+/// The third value: a segment's pass was recorded in the list for the record ([`gather_segments`]): the caller binds
+/// its own pipeline and root signature again.
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
+    end_window(list);
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
     let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
@@ -716,6 +897,140 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
         return None;
     };
     list.gather_slot(src, src_id, offset, spec)
+}
+
+/// The records a segment's pass clamps at most ([`record_segment`]): one group of the clamp, one dispatch.
+pub(crate) const SEGMENT_PASS: u32 = 64;
+/// The passes a list records at most in one recording: its buffer of slots holds `SEGMENT_PASSES * SEGMENT_PASS`
+/// records of [`GATHER_STRIDE`] bytes (128 KiB).
+pub(crate) const SEGMENT_PASSES: u32 = 64;
+
+/// Whether a list that stopped gathering for its prelude ([`gather`]) gathers in segments (`VICTORY_GATHER_SEGMENTS=1`,
+/// with `VICTORY_INDIRECT_GATHER=1`; off by default; `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log). After flipflop877/victory-nvidia-8gb-16fps c69bff19, ported onto this clamp's counted table
+/// (bit 16, as `windowed`).
+///
+/// A list stops gathering at the first command that may write arguments (`State::gather_ends`: a dispatch, a draw
+/// whose shaders may store, an indirect command that is not windowed): the prelude runs before the list, so it cannot
+/// clamp a record written inside it. Every record drawn after that had a pass of its own, between two waits for every
+/// earlier shader write. With the switch the stretch from one such command to the next is a segment: the first record
+/// of a segment (per argument buffer, kind and stride) records ONE pass in the list right there, after the command that
+/// may have written it, and the records drawn after it in the segment take slots that pass fills. The pass reads how
+/// many it has from its table's first word, which the CPU writes as records are taken and the card reads when the list
+/// runs.
+///
+/// Exact as a pass of its own per draw: the pass runs after every command recorded before it (the same full wait for
+/// shader writes first) and before the first draw that reads one of its slots, and nothing between it and those draws
+/// may write arguments: every `State::gather_ends` with stores (whole or by copy), every `HostList::gather_close` and
+/// `gather_wrote` ends all open segments ([`HostList::segments_end`]), and so do the list's close and reset. The rest
+/// of what is recorded between writes no buffer the records come from: our own clamps, windows and gathers write their
+/// scratch buffers; texture copies write textures; read-backs land in buffers of ours; the title's buffer copies and
+/// the host copies' refreshes run before the list (`card_before`), for the pass as for each single clamp. Each draw
+/// takes a slot of its own, so a record drawn twice is clamped and charged twice. The records charge the list's own
+/// budget word as their single clamps did, in draw order within a pass; what moves is that a pass charges its records
+/// when it runs, before passes of ours recorded between its draws: that shows only when the list's budget runs out
+/// (2^27 vertex instances or threads).
+pub(crate) fn gather_segments() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_SEGMENTS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("records after a list stops gathering are gathered in segments, a pass of ours per segment from now (VICTORY_GATHER_SEGMENTS=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Whether an indirect dispatch's own record (one record, no count buffer, not spread) takes a slot of the prelude or
+/// of a segment as a draw's does, and the dispatch ends the gathering after that (`VICTORY_GATHER_DISPATCHES=1`, with
+/// `VICTORY_INDIRECT_GATHER=1`; off by default; `alt` as above). Its record is read before the dispatch runs, and
+/// nothing since the list's last command that may write arguments wrote it.
+pub(crate) fn gather_dispatches() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_DISPATCHES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("indirect dispatches take gathered slots for their own record from now (VICTORY_GATHER_DISPATCHES=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, with [`gather_segments`]: records taken by segments' passes (each had a pass of its own before),
+/// the passes, the records that found no room (the list's passes all used, or no clamp or buffer) and were clamped
+/// alone, as before.
+pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Records, in `l`, a segment's pass ([`gather_segments`]): up to [`SEGMENT_PASS`] records of `kind` and `stride` from
+/// `src`, record `i` at the byte offset that word `i + 1` of the table at `table_gpu` names, as many as its word 0 says
+/// when the list runs; stored clamped at `at + i * stride` of `dst` (in state `before`), which is left in
+/// `INDIRECT_ARGUMENT`; charged to the budget word at `budget`. Waits for every earlier shader write first, as a single
+/// clamp does. Replaces the list's compute root signature and pipeline. False, with nothing recorded, if the layout or
+/// the addresses do not fit the clamp.
+pub(crate) fn record_segment(
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    at: u64,
+    budget: u64,
+    src: &ID3D12Resource,
+    table_gpu: u64,
+    (kind, stride): (u32, u32),
+) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    // SAFETY: live D3D12 buffer resources.
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + at) };
+    if gatherable(src_gpu, 0, (kind, stride)).is_none() || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+        return false;
+    }
+    // Bit 2: gathered from the table; bit 16: its first word is the count, the offsets follow.
+    let constants = [kind, stride, SEGMENT_PASS, 0u32, 4u32 | 16u32, 0u32];
+    let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    let timed = crate::cardmeter::clamp_begin(l);
+    // SAFETY: an open list; our root signature and pipeline; live source, table (the list's upload memory), slot
+    // buffer and budget. Moving the slot buffer out of `INDIRECT_ARGUMENT` orders this pass after the reads of the
+    // slots earlier passes filled. Threads past the table's count return at once and charge nothing.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    crate::cardmeter::end(l, timed);
+    true
 }
 
 /// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
