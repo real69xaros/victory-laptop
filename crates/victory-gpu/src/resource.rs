@@ -3686,6 +3686,8 @@ mod tests {
         drop(held);
         assert!(!textures().contains(&(source as usize)), "the last reference frees it");
         resource_release(view);
+    }
+
     #[cfg(windows)]
     #[test]
     fn retained_array_mip_readback_preserves_box_and_buffer_layout() {
