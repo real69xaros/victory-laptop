@@ -1547,9 +1547,19 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                if helpers_raised() {
+                    // The submitting thread waits for this work: on the
+                    // fast cores and above the title's threads, as it is.
+                    crate::framelog::keep_on_fast_cores("victory-wide");
+                    // SAFETY: a plain call on our own thread.
+                    unsafe {
+                        use windows::Win32::System::Threading::*;
+                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                    }
+                }
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -1606,6 +1616,28 @@ fn wide(jobs: Vec<Job>) {
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// How many threads [`wide`] keeps: a quarter of the logical processors,
+/// 2 to 6, or `VICTORY_WIDE_THREADS=N` (1 to 12; edupode/cold-project-vi
+/// asks for half the cores on its "more CPU cores" option).
+fn wide_threads() -> usize {
+    let default = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    std::env::var("VICTORY_WIDE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(default, |n| n.clamp(1, 12))
+}
+
+/// Whether [`wide`]'s threads run on the fast cores and above normal
+/// priority (`VICTORY_HELPER_PRIORITY=1`; off by default). After
+/// trustno1-coder/VIctory-NVIDIA 80c70b7 (ported by Bebrik229 f682e9d3):
+/// on an i5-12400F the submitting thread stood waiting for helpers at
+/// normal priority that the title's threads kept off the cores; 8.6 -> 9.6
+/// fps, refreshes 23.1 -> 17.6 ms a frame (Series S, 540p).
+fn helpers_raised() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|v| v == "1"))
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's

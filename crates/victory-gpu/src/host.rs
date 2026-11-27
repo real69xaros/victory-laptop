@@ -9613,6 +9613,39 @@ fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
     copy_mapped(dst, src, len, false);
 }
 
+/// Copies of at least this many bytes are cut into pieces for the kept
+/// threads of [`crate::shadow::wide_run`] (`VICTORY_WIDE_COPY=1`; off by
+/// default, an A/B switch). Pieces are [`WIDE_COPY_PIECE`] bytes each.
+/// (From LooperSalty/AnyXboxX c9c9a642: 30.8 -> 34.4 fps on an RTX 4070
+/// SUPER.)
+const WIDE_COPY_MIN: usize = 8 << 20;
+const WIDE_COPY_PIECE: usize = 2 << 20;
+
+fn wide_copy_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_COPY").is_some_and(|v| v == "1"))
+}
+
+/// The `[from, to)` pieces that cover `len` bytes, `piece` bytes each (the
+/// last one may be shorter).
+fn piece_bounds(len: usize, piece: usize) -> Vec<(usize, usize)> {
+    (0..len.div_ceil(piece)).map(|i| (i * piece, ((i + 1) * piece).min(len))).collect()
+}
+
+/// [`copy_mapped`] of a big copy, piece by piece on several threads. Each
+/// piece is shorter than [`WIDE_COPY_MIN`], so it does not come back here.
+fn copy_pieces(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let (d, s) = (dst as usize, src as usize);
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = piece_bounds(len, WIDE_COPY_PIECE)
+        .into_iter()
+        .map(|(a, b)| {
+            Box::new(move || copy_mapped((d + a) as *mut u8, (s + a) as *const u8, b - a, title_dst))
+                as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -9634,6 +9667,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         _ => {}
     }
     if len == 0 {
+        return;
+    }
+    if len >= WIDE_COPY_MIN && wide_copy_on() {
+        copy_pieces(dst, src, len, title_dst);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -11577,5 +11614,34 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod piece_copy_tests {
+    use super::{copy_pieces, piece_bounds};
+
+    /// The pieces cover the copy exactly once, the last one shorter.
+    #[test]
+    fn pieces_cover_the_copy_once() {
+        assert_eq!(piece_bounds(0, 4), vec![]);
+        assert_eq!(piece_bounds(4, 4), vec![(0, 4)]);
+        assert_eq!(piece_bounds(10, 4), vec![(0, 4), (4, 8), (8, 10)]);
+        let len = 9 << 20;
+        let cut = piece_bounds(len, 2 << 20);
+        assert_eq!(cut.len(), 5);
+        assert_eq!(cut.iter().map(|(a, b)| b - a).sum::<usize>(), len);
+        assert!(cut.windows(2).all(|w| w[0].1 == w[1].0));
+    }
+
+    /// A big copy made on several threads copies every byte, the last
+    /// partial piece included.
+    #[test]
+    fn a_big_copy_in_pieces_copies_every_byte() {
+        let len = (9 << 20) + 4097;
+        let src: Vec<u8> = (0..len).map(|i| (i * 131 + i / 4099) as u8).collect();
+        let mut dst = vec![0u8; len];
+        copy_pieces(dst.as_mut_ptr(), src.as_ptr(), len, false);
+        assert!(dst == src, "the pieces did not copy the same bytes");
     }
 }
