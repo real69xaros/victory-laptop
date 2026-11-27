@@ -2888,23 +2888,76 @@ fn relay_merge_bucket(start: u64, offset: usize, bytes: usize) -> usize {
 
 const MERGE_BUCKETS: usize = 8;
 
-/// The CPU relay takes whole spans per worker. Aliased spans in one
-/// landing keep their original order on the landing thread.
-fn separate_ranges(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
-    let mut ranges: Vec<_> = ranges.filter(|(lo, hi)| lo < hi).collect();
+/// Hold the mapping stable through an eligible parallel CPU landing.
+fn unaliased_landing(ranges: impl Iterator<Item = (usize, usize)>) -> Option<crate::watch::Reading> {
+    let mapped = crate::watch::title_memory_reading_now()?;
+    (!crate::inplace::touches_aliased_page(ranges)).then_some(mapped)
+}
+
+/// Check virtual overlap when the landing does not bucket by title page.
+fn spans_do_not_overlap(ranges: &mut [(usize, usize)]) -> bool {
     ranges.sort_unstable();
-    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0) && !crate::inplace::touches_aliased_page(ranges.into_iter())
+    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+}
+
+fn separate_landing(ranges: impl Iterator<Item = (usize, usize)>) -> Option<crate::watch::Reading> {
+    let mut ranges: Vec<_> = ranges.filter(|(lo, hi)| lo < hi).collect();
+    if !spans_do_not_overlap(&mut ranges) {
+        return None;
+    }
+    unaliased_landing(ranges.into_iter())
 }
 
 #[cfg(test)]
 mod relay_bucket_tests {
-    use super::{relay_merge_bucket, separate_ranges};
+    use super::{relay_merge_bucket, separate_landing, spans_do_not_overlap};
     use crate::watch::PAGE;
 
     #[test]
     fn adjacent_cpu_spans_can_land_together() {
-        assert!(separate_ranges([(9, 12), (2, 9), (7, 7)].into_iter()));
-        assert!(!separate_ranges([(2, 10), (4, 7)].into_iter()));
+        assert!(spans_do_not_overlap(&mut [(9, 12), (2, 9)]));
+        assert!(!spans_do_not_overlap(&mut [(2, 10), (4, 7)]));
+    }
+
+    #[test]
+    fn parallel_landing_keeps_the_mapping_pinned_until_workers_finish() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mapped = loop {
+            if let Some(mapped) = separate_landing([(2, 4), (5, 8)].into_iter()) {
+                break mapped;
+            }
+            assert!(Instant::now() < deadline, "test mapping remained busy");
+            std::thread::yield_now();
+        };
+        let (attempting, about_to_remap) = mpsc::channel();
+        let (changed, remapped) = mpsc::channel();
+        let remapper = std::thread::spawn(move || {
+            attempting.send(()).unwrap();
+            let _changing = crate::watch::title_memory_remapping();
+            changed.send(()).unwrap();
+        });
+        about_to_remap.recv().unwrap();
+        let premature = remapped.recv_timeout(Duration::from_millis(100));
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let jobs = (0..2)
+            .map(|_| {
+                let writes = writes.clone();
+                Box::new(move || {
+                    writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        drop(mapped);
+        remapper.join().unwrap();
+
+        assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(premature, Err(mpsc::RecvTimeoutError::Timeout));
+        remapped.recv().unwrap();
     }
 
     /// Two different virtual ranges can still update the same byte.
@@ -2923,7 +2976,7 @@ mod relay_bucket_tests {
             crate::inplace::title_memory_view(a, 2 * PAGE, section as usize, 0);
             crate::inplace::title_memory_view(b, PAGE, section as usize, 0);
             let writes = [(a + 7, a + 12), (b + 9, b + 11)];
-            let parallel = separate_ranges(writes.into_iter());
+            let parallel = separate_landing(writes.into_iter()).is_some();
             let second_page = crate::inplace::touches_aliased_page([(a + PAGE, a + PAGE + 1)].into_iter());
             for ((lo, hi), byte) in writes.into_iter().zip([1u8, 2]) {
                 std::ptr::write_bytes(lo as *mut u8, byte, hi - lo);
@@ -4766,7 +4819,12 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-    if wide_merge() && work.len() >= 8 && separate_ranges(work.iter().map(|(_, from, to)| (*from, *to))) {
+    if wide_merge() && work.len() >= 8
+        && let Some(_mapped) = separate_landing(work.iter().map(|(shadow, from, to)| {
+            let start = shadow.span().0 as usize;
+            (start + from, start + to)
+        }))
+    {
         // The spans of a copy are apart from one another, so several copies
         // at a time; every span of one copy shares a bucket and merges in
         // order.
@@ -6222,12 +6280,12 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let written = if wide_merge() && pieces.len() >= 8 && !crate::inplace::touches_aliased_page(
-            pieces.iter().map(|(shadow, lo, hi, _)| {
+        let written = if wide_merge() && pieces.len() >= 8
+            && let Some(_mapped) = unaliased_landing(pieces.iter().map(|(shadow, lo, hi, _)| {
                 let start = shadow.span().0 as usize;
                 (start + lo, start + hi)
-            }),
-        ) {
+            }))
+        {
             let mut buckets: [Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>; MERGE_BUCKETS] =
                 std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at) in pieces {
@@ -6405,12 +6463,12 @@ impl Host {
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
         let piece_count = pieces.len();
-        let (written, bytes) = if wide_merge() && piece_count >= 8 && !crate::inplace::touches_aliased_page(
-            pieces.iter().map(|(shadow, lo, hi, _, _)| {
+        let (written, bytes) = if wide_merge() && piece_count >= 8
+            && let Some(_mapped) = unaliased_landing(pieces.iter().map(|(shadow, lo, hi, _, _)| {
                 let start = shadow.span().0 as usize;
                 (start + lo, start + hi)
-            }),
-        ) {
+            }))
+        {
             let mut buckets: [Vec<Piece>; MERGE_BUCKETS] = std::array::from_fn(|_| Vec::new());
             for (shadow, lo, hi, at, after) in pieces {
                 let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
@@ -6694,10 +6752,12 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 && separate_ranges(pieces.iter().map(|&(i, lo, hi, _)| {
-                let start = plan.ranges[i].shadow.span().0 as usize;
-                (start + lo, start + hi)
-            })) {
+            if wide_merge() && pieces.len() >= 8
+                && let Some(_mapped) = separate_landing(pieces.iter().map(|&(i, lo, hi, _)| {
+                    let start = plan.ranges[i].shadow.span().0 as usize;
+                    (start + lo, start + hi)
+                }))
+            {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
